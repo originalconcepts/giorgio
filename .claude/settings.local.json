@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep -E \"ocws-\\(he_IL|en_US\\)\\\\.\\(mo|po|l10n\\\\.php\\)$\")",
+      "Bash(grep -E \"\\\\.\\(mo|po|l10n\\\\.php|pot\\)$\")"
+    ]
+  }
+}

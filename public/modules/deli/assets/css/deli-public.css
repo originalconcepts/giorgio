@@ -1,0 +1,426 @@
+.header-delivery-settings {
+    width: 320px;
+}
+.header-delivery-settings .delivery-settings-screen-1 {
+    width: 100%;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+}
+.header-delivery-settings .delivery-dropdown-toggle {
+    width: 100%;
+}
+.btn-check {
+    position: absolute;
+    clip: rect(0,0,0,0);
+    pointer-events: none;
+}
+.btn-check:checked+.btn {
+    color: darkgreen;
+    background-color: white;
+    border-color: green;
+}
+.cds-hidden {
+    display: none!important;
+}
+.delivery-settings-screen-1-2 {
+    display: flex;
+    flex-direction: column;
+    flex-wrap: nowrap;
+    align-items: center;
+}
+.delivery-settings-text {
+    text-align: center;
+    margin-bottom: 20px;
+    padding: 0 20px;
+}
+.minicart-shipping-methods {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    grid-template-rows: 1fr;
+    column-gap: 25px;
+    width: 100%;
+    justify-items: center;
+}
+.cart-delivery-settings {
+    padding: 25px;
+}
+.cart-delivery-settings .selected-city select {
+    width: 100%;
+    margin-bottom: 20px;
+}
+.cart-delivery-settings .form-label {
+    font-weight: bold;
+    padding: 10px 0;
+}
+.cart-delivery-settings .ui-datepicker-inline {
+    width: 100%;
+}
+@media screen and (min-width: 600px) {
+    .cart-delivery-settings .ui-datepicker td {
+        line-height: 50px;
+    }
+    .cart-delivery-settings .ui-datepicker td span, .cart-delivery-settings .ui-datepicker td a {
+        text-align: center;
+    }
+}
+.minicart-shipping-slots, .minicart-pickup-slots {
+    display: flex;
+    flex-direction: row;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    justify-content: flex-start;
+}
+.minicart-shipping-slots span.slot, .minicart-pickup-slots span.slot {
+    display: inline-block;
+    padding: 10px;
+    font-weight: bold;
+    line-height: 1;
+    color: grey;
+    text-align: center;
+    white-space: nowrap;
+    vertical-align: baseline;
+    border-radius: 20px;
+    border: solid 1px lightgrey;
+    cursor: pointer;
+}
+.minicart-shipping-slots span.slot.selected, .minicart-pickup-slots span.slot.selected {
+    border-color: #F15D2A;
+}
+.cart-delivery-settings .cart-shipping-method-wraper {
+    width: 100%;
+    text-align: center;
+    height: 200px;
+    border: solid 1px #F15D2A;
+    color: #F15D2A;
+    background-color: white;
+    display: flex;
+    align-items: center;
+}
+.cart-delivery-settings .cart-shipping-method-wraper .btn {
+    color: #F15D2A;
+    background-color: white;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    height: 198px;
+    flex-direction: column-reverse;
+}
+.cart-delivery-settings .cart-shipping-method-wraper.selected {
+    border: solid 1px #F15D2A;
+    color: white;
+    background-color: #F15D2A;
+}
+.cart-delivery-settings .cart-shipping-method-wraper.selected .btn {
+    color: white;
+    background-color: #F15D2A;
+}
+.cart-delivery-settings-actions {
+    position: absolute;
+    bottom: 35px;
+    left: 0;
+    right: 0;
+    display: flex;
+    justify-content: center;
+    padding: 25px;
+}
+.cart-delivery-settings-actions .cds-button-submit, .cart-delivery-settings-actions .cds-button-submit:hover {
+    color: white;
+    background-color: #F15D2A;
+    padding: 20px 35px;
+    width: 100%;
+    max-width: none;
+}
+.delivery-data-chip, .checkout-delivery-data-chip {
+    display: flex;
+    flex-flow: row nowrap;
+    justify-content: space-between;
+    align-items: center;
+    padding: 20px 25px;
+}
+.delivery-data-chip .cds-data, .checkout-delivery-data-chip .cds-data {
+    display: flex;
+    flex-flow: row nowrap;
+    justify-content: flex-start;
+    align-items: center;
+    gap: 10px;
+}
+.delivery-data-chip button.cds-button-change {
+
+}
+.checkout-delivery-data-chip a.cds-button-change {
+
+}
+.ui-front { z-index: 1110 !important; }
+.ui-dialog {
+    z-index: 1111 !important;
+    border-radius: 0!important;
+    text-align: center;
+}
+.ui-dialog-titlebar-close:before {
+    background-color: white!important;
+}
+.ui-dialog-titlebar {
+    background: none!important;
+    border: none!important;
+}
+.ui-dialog-title {
+    display:none;
+}
+
+.ui-dialog-titlebar {
+    background:transparent;
+    border:none;
+}
+
+.ui-dialog .ui-dialog-titlebar-close {
+    right:0;
+    overflow: hidden;
+}
+#dialog h3 {
+    font-size: xx-large;
+    margin: 20px;
+}
+#dialog .cds-dialog-title {
+    margin: 20px;
+    padding: 0;
+}
+#dialog .cds-dialog-text {
+    margin: 20px;
+    padding: 0;
+}
+.ui-dialog .ui-dialog-buttonpane {
+    text-align: center!important;
+    border: none!important;
+    margin-top: 0.5em!important;
+    margin-bottom: 2em!important;
+    padding: 1em!important;
+    display: flex;
+    flex-flow: row nowrap;
+    justify-content: center;
+}
+.ui-dialog-buttonset {
+    display: flex;
+    flex-flow: row nowrap;
+    justify-content: center;
+    gap: 1em;
+    width: 100%;
+}
+.ui-dialog-buttonset button {
+    padding: 20px;
+}
+
+body.ocws-deli-style-checkout form.checkout .slot-list-container {
+    display: none!important;
+}
+body.ocws-deli-style-checkout form.checkout .woocommerce-shipping-methods {
+    display: none!important;
+}
+body.ocws-deli-style-checkout form.checkout #billing_google_autocomplete_field {
+    display: none!important;
+}
+body.ocws-deli-style-checkout form.checkout .slot-message {
+    display: none!important;
+}
+body.ocws-deli-style-checkout form.checkout .oc-woo-pickup-additional-title {
+    display: none!important;
+}
+
+.mini-cart-icon .ocws-minicart-chip {
+    display: inline-flex;
+    flex-direction: column;
+    font-size: smaller;
+    color: darkgrey;
+}
+button.cds-mini-close {
+    position: absolute;
+    left: auto;
+    right: 15px;
+    top: 23px;
+    width: 15px;
+    height: 15px;
+    border: none;
+    box-shadow: none;
+    background-color: transparent!important;
+    cursor: pointer;
+    padding: 0;
+    z-index: 10;
+    transform: none;
+}
+button.cds-mini-close:hover {
+    background-color: transparent!important;
+}
+button.cds-mini-close:before {
+    z-index: -1;
+    background: none;
+    width: 100%;
+}
+button.cds-mini-close svg path {
+    stroke: #000;
+}
+button.cds-mini-close:not(.slick-arrow):before, button.cds-mini-close:not(.btn-qty):before {
+    background-color: transparent!important;
+}
+.ocws-availability-message.ocws-not-available + .quantity--wrapper {
+    display: none!important;
+}
+.ocws-availability-message.ocws-not-available {
+    margin: 15px auto 0;
+    display: flex;
+    justify-content: center;
+    text-align: center;
+    height: 45px;
+    background-color: #E6E6E6;
+    color: #858585;
+    align-items: center;
+}
+td.holiday {
+    position: relative;
+}
+td.holiday:before {
+    position: absolute;
+    height: 50%;
+    line-height: 20px;
+    color: orange;
+    content: attr(title);
+}
+.woocommerce form .woocommerce-billing-fields .form-row.other-recipient-field label {
+    opacity: 1;
+}
+.diff-address-shipping {
+    display: none!important;
+}
+.ocws-deli-style-checkout form.checkout #oc-woo-shipping-additional,
+.ocws-deli-style-checkout form.checkout #oc-woo-pickup-additional{
+    display: none!important;
+}
+#ocws_other_recipient {
+    margin: 0!important;
+}
+.ocws-deli-style #billing_house_num_field.ocws-polygon-related label {
+    visibility: visible;
+    display: block;
+}
+.ocws-availability-message.ocws-not-available+form.cart {
+    display: none!important;
+}
+li[data-hidden="1"] {
+    display: none!important;
+}
+.woocommerce-error.hidden-notice {
+    display: none!important;
+}
+.minicart-form-messages {
+    position: relative;
+    margin-top: 10px;
+}
+.minicart-form-messages .loader {
+    width: 30px;
+    height: 30px;
+    border-radius: 50%;
+    display: inline-block;
+    border-top: 3px solid #FFF;
+    border-right: 3px solid transparent;
+    box-sizing: border-box;
+    animation: rotation 1s linear infinite;
+    position: absolute;
+    top: 50%;
+    left: 50%;
+}
+@keyframes rotation {
+    0% {
+        transform: rotate(0deg);
+    }
+    100% {
+        transform: rotate(360deg);
+    }
+}
+
+.minicart-shipping-options .ocws-checkout-inputs-pp span.error, #oc-woo-shipping-additional .slot-message {
+    color: #F15D2A;
+    font-size: 16px;
+    margin-top: 15px;
+}
+
+.ocws-pending-product-chip {
+    padding: 10px;
+    margin: 10px 0;
+    border: 2px solid #F15D2A;
+    border-radius: 5px;
+    color: #F15D2A;
+    display: inline-block;
+}
+
+.ocws-removed-items-chip {
+    background-color: #dfdfdf;
+    padding: 20px;
+    margin: 10px -30px;
+}
+.ocws-removed-items-chip .title {
+    font-size: 18px;
+    font-weight: 700;
+}
+.ocws-removed-items-chip .buttons-here {
+    position: relative;
+}
+.ocws-removed-items-chip .buttons-here>.buttons{
+    position: absolute;
+    width: 50px;
+    height: 30px;
+    right: auto;
+    left: 5px;
+    top: 0;
+    z-index: 25;
+}
+.ocws-removed-items-chip .sub-title {
+    color: #979797;
+    font-size: 12px;
+}
+ul.ocws-minicart-removed-items {
+    margin-top: 20px;
+}
+ul.ocws-minicart-removed-items li>a {
+    background: #fff;
+    margin: 5px;
+    line-height: 20px;
+    font-size: 15px;
+    border: solid 1px darkgray;
+    border-radius: 20px;
+    color: black;
+    padding: 5px 10px;
+    display: block;
+    height: 30px;
+}
+.ocws-removed-items-chip .slick-prev
+{
+    left: 0;
+}
+[dir='rtl'] .ocws-removed-items-chip .slick-prev
+{
+    right: 0;
+    left: auto;
+}
+.ocws-removed-items-chip .slick-next
+{
+    right: 0;
+}
+[dir='rtl'] .ocws-removed-items-chip .slick-next
+{
+    right: auto;
+    left: 0;
+}
+.cart-delivery-settings .ui-datepicker td.ui-datepicker-current-day a.ui-state-active {
+    border: 1px solid #F15D2A;
+    background-color: white;
+    color: black;
+}
+.cart-delivery-settings .ui-datepicker td.ui-datepicker-current-day.ocws-deli-selected-date a.ui-state-active {
+    border: 1px solid transparent;
+    background-color: #F15D2A;
+    color: white;
+}
+.product-type-simple .bottom-part .ocws-availability-message.ocws-not-available {
+    display: flex;
+    margin-top: auto;
+
+}

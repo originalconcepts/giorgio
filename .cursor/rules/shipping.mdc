@@ -1,0 +1,75 @@
+---
+  Use when working on shipping, delivery, pickup, or checkout flow 
+  in this WordPress site. Covers the oc-woo-shipping plugin (OCWS): 
+  delivery method selection, pickup branches, the choose-shipping popup, 
+  shipping rates, delivery fields, mini-cart delivery chip, and checkout 
+  session data. Trigger phrases: "המשלוח לא נשמר", "לא רואה את העיר", 
+  "פופאפ המשלוחים נפתח אוטומטית", "shipping not saving", "delivery popup", 
+  "pickup branch", "OCWS", "choose-shipping", "checkout_data session", 
+  "ocws_shipping_popup_confirmed".
+globs:
+  - "wp-content/plugins/oc-woo-shipping/**/*.php"
+  - "wp-content/plugins/oc-woo-shipping/public/**/*.js"
+alwaysApply: false
+---
+
+## ⚠️ Debug verification (temporary)
+
+When you use information from this skill in your answer, you MUST append this exact marker to the end of your response:
+
+`[SKILL-LOADED: shipping.mdc 🚢]`
+
+This is a temporary verification mechanism for the developer. It will be removed after testing.
+
+
+## When to use this skill
+
+Use when working on **delivery/pickup selection**, the **`#choose-shipping`** popup (`.choose-shipping-popup.ocws-popup`), **mini-cart delivery chip** (`#ocws-delivery-data-chip`), **session `checkout_data`**, **shipping method IDs** (`oc_woo_advanced_shipping_method`, `oc_woo_local_pickup_method`), **OCWS AJAX** (`oc_woo_shipping_*`), or **`ocws_shipping_popup_confirmed`** behavior.
+
+## Core files
+
+- `wp-content/plugins/oc-woo-shipping/oc-woo-shipping.php` — bootstrap, `composer install` guard, constants (e.g. `OC_WOO_SHIPPING_VERSION` vs header Version mismatch is possible).
+- `wp-content/plugins/oc-woo-shipping/includes/class-oc-woo-shipping.php` — registers public hooks (`define_public_hooks`), loads Deli/Digitalp modules, `Oc_Woo_Shipping::$plugin_name` is `'ocws'`.
+- `wp-content/plugins/oc-woo-shipping/includes/class-ocws-popup.php` — `OCWS_Popup::output_shipping_popup()`; reads `ocws_shipping_popup_confirmed` before mirroring `chosen_shipping_methods` into the popup (avoids pre-selected home delivery before first submit).
+- `wp-content/plugins/oc-woo-shipping/includes/class-oc-woo-ajax.php` — `OC_Woo_Ajax::init`, nopriv AJAX: `checkout_save_shipping_info`, `set_shipping_city`, `set_pickup_branch`, `popup_html`, etc.; sets `ocws_shipping_popup_confirmed` in `set_shipping_city` / `set_pickup_branch` after successful save.
+- `wp-content/plugins/oc-woo-shipping/public/class-oc-woo-shipping-public.php` — checkout field filters, `save_checkout_data_to_session`, `add_shipping_popup`, `get_checkout_delivery_data`, chip HTML `show_chip_in_cart` / `woocommerce_add_to_cart_fragments_filter`, backup/restore of OCWS prefs on cart changes.
+- `wp-content/plugins/oc-woo-shipping/includes/oc-woo-shipping-core-functions.php` — `ocws_is_method_id_pickup`, `ocws_is_method_id_shipping`, `ocws_update_session_checkout_field`, polygon/city helpers.
+- `wp-content/plugins/oc-woo-shipping/includes/class-ocws-advanced-shipping.php` — `OCWS_Advanced_Shipping::SHIPPING_METHOD_ID` = `oc_woo_advanced_shipping_method`.
+- `wp-content/plugins/oc-woo-shipping/includes/local-pickup/class-ocws-lp-local-pickup.php` — `OCWS_LP_Local_Pickup::PICKUP_METHOD_ID` = `oc_woo_local_pickup_method`.
+- `wp-content/plugins/oc-woo-shipping/template-parts/public/popup.php` — markup: `.choose-shipping-popup.ocws-popup`, `form#choose-shipping`.
+- `wp-content/plugins/oc-woo-shipping/public/js/oc-woo-shipping-public.js` — delegated handlers on `#choose-shipping` (submit, `popup-shipping-method`, pickup fields, close `.choose-shipping-popup.ocws-popup`); chip click `#ocws-delivery-data-chip.delivery-data-chip .cds-button-change`.
+- `wp-content/plugins/oc-woo-shipping/includes/class-ocws-cart-syncronizer.php` — session sync / `checkout_data` restore paths.
+
+## Main flows
+
+- **Popup output (non-Deli):** `Oc_Woo_Shipping_Public::add_shipping_popup` on `wp_footer` (priority 1) — skips `is_checkout()` and `wp_doing_ajax()`; returns early if `ocws_use_deli_style()`; calls `OCWS_Popup::output_shipping_popup()`. Controlled in part by option `ocws_common_use_popup` and local `$forse_use_popup = true` in code.
+- **Confirmation flag:** `WC()->session->get( 'ocws_shipping_popup_confirmed' )` — until true, popup logic avoids treating WC’s auto `chosen_shipping_methods` as the user’s choice (`OCWS_Popup::output_shipping_popup`). After AJAX save, `OC_Woo_Ajax::set_shipping_city` and `OC_Woo_Ajax::set_pickup_branch` run `WC()->session->set( 'ocws_shipping_popup_confirmed', true )` (and totals/shipping refresh). הערה מול מסמך ארכיטקטורה: גם תבנית `deliz-short` נוגעת בדגל הזה (gate/SMS) — אבל **הצד התוסף** מגדיר אותו בסיום ה-Ajax הללו, לא רק בתבנית.
+- **Checkout session fields:** `woocommerce_checkout_update_order_review` → `Oc_Woo_Shipping_Public::save_checkout_data_to_session` — merges posted data into `WC()->session` `checkout_data`. `woocommerce_checkout_get_value` → `woocommerce_checkout_get_value_from_session` (priority 1001) fills polygon/session-backed billing fields.
+- **Front scripts:** `Oc_Woo_Shipping_Public::enqueue_scripts` registers handle **`ocws`** (`$this->plugin_name`) for `public/js/oc-woo-shipping-public.js`; optional `ocws-google-maps-init`, `ocws-cookie`, Deli/Owl assets.
+- **Mini-cart chip & fragments:** `woocommerce_before_mini_cart` / `oc_woo_minicart_bottom_before` → `show_chip_in_*`; `woocommerce_add_to_cart_fragments` → `Oc_Woo_Shipping_Public::woocommerce_add_to_cart_fragments_filter` updates `div#ocws-delivery-data-chip`.
+- **Method classification:** `ocws_is_method_id_pickup( $method_id )`, `ocws_is_method_id_shipping( $method_id )` in `oc-woo-shipping-core-functions.php`.
+- **Deli module:** when `ocws_use_deli_style()`, extra Deli classes load from `modules/deli/`; `add_shipping_popup` bails — storefront behavior differs (Deli JS/CSS).
+
+## Common mistakes - DO NOT
+
+- אל תניח ש־`chosen_shipping_methods` בלבד משקף בחירת לקוח לפני `ocws_shipping_popup_confirmed` — `OCWS_Popup` בכוונה לא משכפל rate נבחר עד אישור.
+- אל תפתח/תסגור פופאפ רק עם `.choose-shipping-popup` בלי להבדיל — בקוד הציבורי נשענים על **`.choose-shipping-popup.ocws-popup`** כדי לא לבלבל עם פופאפי ערים/סניפים (`.ocws-checkout-city-list-popup` וכו’).
+- אל תדרוס `checkout_data` בלי להבין את `ocws_update_session_checkout_field` ואת הגיבוי/שחזור בסל (`maybe_backup_ocws_delivery_prefs_*`, `maybe_restore_ocws_delivery_prefs_*`, `maybe_realign_ocws_chosen_shipping_*`).
+- זכור: יש פילטר גלובלי `woocommerce_cart_needs_shipping_address` המוכפל ל־`false` ב־`class-oc-woo-shipping.php` — שינוי דרישות כתובת משלוח חייב להתחשב בכך.
+- אל תערוך לוגיקת submit של `#choose-shipping` בלי לבדוק את `public/js/oc-woo-shipping-public.js` (כולל טריגרים מוויזארד SMS בתבנית שמפעילים `$('#choose-shipping').trigger('submit')`).
+
+## תרגומים (`ocws`)
+
+תיעוד מלא: `wp-content/plugins/oc-woo-shipping/languages/I18N.md`
+
+- קבצים: `languages/ocws.pot`, `ocws-he_IL.po`, **`ocws-he_IL.mo`** (חובה על השרת).
+- סריקת מילים חדשות: `languages/I18N.md` § «סריקת מילים חדשות» — `bash languages/update-i18n.sh` (make-pot → update-po → make-mo).
+- Loco: Save + **Compile**; פורמט MO, מיקום Author.
+- מחרוזת באנגלית: בדוק MO מעודכן על השרת, locale `he_IL`, cache, domain `ocws` בקוד.
+- טעינה: `includes/class-oc-woo-shipping-i18n.php` — MO מתוך `languages/` בלבד (+ גיבוי ל-NOOP ב-WP 6.x).
+
+## Related skills
+
+- `wp-content/themes/deliz-short/.cursor/rules/theme.mdc` — שער צ’קאאוט (`delizOcwsCheckoutGateRun`), פרגמנט צ’יפ, SMS embed ל־`#choose-shipping`, ו־AJAX `deliz_ocws_shipping_status`.
+- `wp-content/plugins/oc-woo-sale-units/.cursor/rules/sale-units.mdc` — יחידות/משקל בעגלה; נפרד מליבת המשלוחים אבל מופיע יחד בצ’קאאוט ובמיניקארט.
+- `wp-content/plugins/oc-storeos-integration/.cursor/rules/storeos.mdc` — סנכרון הזמנה/כתובת אחרי צ’קאאוט; מושפע ממטא ש־OCWS שומר בהזמנה.
