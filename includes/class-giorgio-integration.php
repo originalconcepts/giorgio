@@ -12,10 +12,15 @@ class OC_StoreOS_Integration {
     const META_LAST_SYNC = '_oc_storeos_last_sync';
 
     /** @var string Uploads-relative directory for REST incoming log. */
-    const REST_INCOMING_LOG_DIR = 'oc-storeos-integration';
+    const REST_INCOMING_LOG_DIR = 'giorgio';
 
     /** @var string Log file name (under REST_INCOMING_LOG_DIR or WP_CONTENT_DIR fallback). */
     const REST_INCOMING_LOG_FILE = 'incoming-rest-orders.log';
+
+    /**
+     * Outgoing (WooCommerce → Giorgio/Giorgio) payload log file. Same directory as the incoming log.
+     */
+    const REST_OUTGOING_LOG_FILE = 'outgoing-rest-orders.log';
 
     /**
      * Transient: hash of last successful WooCommerce/Order JSON per order (duplicate POST guard).
@@ -26,7 +31,7 @@ class OC_StoreOS_Integration {
     const OUT_ORDER_DEDUP_TTL = 45;
 
     /**
-     * Payment-method row: "do not send order to StoreOS for this gateway" (per-method override).
+     * Payment-method row: "do not send order to Giorgio for this gateway" (per-method override).
      */
     const PAYMENT_METHOD_SEND_ORDER_STATUS_OFF = '__oc_storeos_send_order_off__';
 
@@ -64,7 +69,32 @@ class OC_StoreOS_Integration {
     /**
      * WooCommerce logger source (WooCommerce → Status → Logs).
      */
-    const WC_LOG_SOURCE = 'oc-storeos-integration';
+    const WC_LOG_SOURCE = 'giorgio';
+
+    /**
+     * REST namespace for inbound Giorgio calls. The new brand namespace is primary; the legacy
+     * namespace is still registered as an alias so the Giorgio backend keeps working until it is
+     * updated to call the new one. The settings page shows the primary namespace only.
+     */
+    const REST_NAMESPACE        = 'giorgio/v1';
+    const REST_NAMESPACE_LEGACY = 'oc-storeos/v1';
+
+    /**
+     * Preferred header name for the inbound shared secret (Giorgio → WooCommerce).
+     * `X-Api-Key` and `Authorization: Bearer <token>` are also accepted for symmetry
+     * with the outbound calls.
+     */
+    const HEADER_INCOMING_TOKEN = 'X-OC-Giorgio-Token';
+
+    /**
+     * Inbound auth enforcement modes (option `incoming_auth_mode`).
+     * - off     : no checking (legacy behavior). Default, so updating never breaks a live site.
+     * - log     : verify + log the result, but allow every request through (rollout / debugging).
+     * - enforce : reject (HTTP 401) when the secret is configured and the request token is missing/wrong.
+     */
+    const INCOMING_AUTH_MODE_OFF     = 'off';
+    const INCOMING_AUTH_MODE_LOG     = 'log';
+    const INCOMING_AUTH_MODE_ENFORCE = 'enforce';
 
     /**
      * Guard against nested / duplicate dispatch in the same request (e.g. payment_complete + status completed).
@@ -86,6 +116,14 @@ class OC_StoreOS_Integration {
      * @var array<int, true>
      */
     protected static $outgoing_sync_after_creation_done = array();
+
+    /**
+     * Re-entrancy guard for the HPOS-safe `woocommerce_update_order` Cardcom trigger,
+     * so meta saved by our own dispatch cannot recurse into another dispatch.
+     *
+     * @var array<int, true>
+     */
+    protected static $cardcom_order_save_trigger_running = array();
 
     /**
      * Singleton instance.
@@ -115,12 +153,17 @@ class OC_StoreOS_Integration {
         add_action( 'admin_menu', array( $this, 'register_settings_page' ) );
         add_action( 'admin_init', array( $this, 'register_settings' ) );
 
+        // "Settings" link on the Plugins list row.
+        if ( defined( 'OC_STOREOS_INTEGRATION_PLUGIN_FILE' ) ) {
+            add_filter(
+                'plugin_action_links_' . plugin_basename( OC_STOREOS_INTEGRATION_PLUGIN_FILE ),
+                array( $this, 'add_settings_action_link' )
+            );
+        }
+
         // Add optional percentage fee to the cart/checkout totals.
         add_action( 'woocommerce_cart_calculate_fees', array( $this, 'add_order_percentage_fee' ), 20, 1 );
         add_action( 'wp_head', array( $this, 'render_fee_tooltip_styles' ) );
-
-        // Temporary debug helper for order meta (order ID 1921).
-//        add_action( 'init', array( $this, 'debug_order_meta_1921' ) );
 
         // REST API.
         add_action( 'rest_api_init', array( $this, 'register_rest_routes' ) );
@@ -129,7 +172,7 @@ class OC_StoreOS_Integration {
         // Outgoing order: sync when the order hits the effective WC status for that order's payment method (not on creation).
         add_action( 'woocommerce_order_status_changed', array( $this, 'handle_order_status_for_storeos_outgoing' ), 20, 4 );
 
-        // Payment webhook (Woo → StoreOS OrderPayment), new format — late so Cardcom meta is saved first.
+        // Payment webhook (Woo → Giorgio OrderPayment), new format — late so Cardcom meta is saved first.
         add_action( 'woocommerce_payment_complete', array( $this, 'handle_payment_complete_webhook_v2' ), 99, 1 );
         add_action( 'woocommerce_order_status_changed', array( $this, 'handle_order_completed_payment_webhook_v2' ), 99, 4 );
 
@@ -138,13 +181,17 @@ class OC_StoreOS_Integration {
         add_action( 'updated_post_meta', array( $this, 'maybe_send_payment_webhook_v2_after_cardcom_meta_saved' ), 20, 4 );
         add_action( 'added_post_meta', array( $this, 'maybe_send_payment_webhook_v2_after_cardcom_meta_saved' ), 20, 4 );
 
+        // HPOS-safe complementary trigger: under custom order tables the postmeta hooks above do not
+        // fire for order meta, so also re-check on order save (cheap no-op unless a Cardcom deal exists).
+        add_action( 'woocommerce_update_order', array( $this, 'maybe_trigger_after_order_save_for_cardcom' ), 20, 2 );
+
         // Retry outgoing order shortly when waiting for Cardcom transaction meta.
         add_action( 'oc_storeos_retry_outgoing_order_after_cardcom_tx', array( $this, 'retry_outgoing_order_after_cardcom_tx' ), 10, 1 );
 
         // Cardcom מתחבר ל־woocommerce_order_status_completed בעדיפות 10; ריענון סכום ב־DB לפני כן (מתעלמים מתוסף Cardcom).
         add_action( 'woocommerce_order_status_completed', array( $this, 'maybe_refresh_order_totals_before_cardcom_capture' ), 5, 2 );
 
-        // Make sure StoreOS-created orders have a nice, readable address
+        // Make sure Giorgio-created orders have a nice, readable address
         // in the WooCommerce order screen preview, even when OC Woo Shipping
         // overrides the default formatting.
         add_filter( 'woocommerce_order_get_formatted_billing_address', array( $this, 'filter_formatted_billing_address' ), 20, 2 );
@@ -168,18 +215,75 @@ class OC_StoreOS_Integration {
         if ( '' === $v || '0' === $v ) {
             return;
         }
-        error_log( sprintf( '[OC StoreOS] updated_post_meta: cardcom meta saved. order_id=%s meta_key=%s meta_value_prefix=%s', (string) $object_id, (string) $meta_key, substr( $v, 0, 80 ) ) );
         if ( ! is_numeric( $object_id ) || (int) $object_id < 1 ) {
             return;
         }
-        if ( function_exists( 'get_post_type' ) && 'shop_order' !== (string) get_post_type( (int) $object_id ) ) {
-            return;
-        }
 
+        // NB: do not gate on get_post_type() === 'shop_order'. Under HPOS the order is not a post,
+        // so that check would wrongly reject. wc_get_order() resolves the id in both storage modes;
+        // the instanceof check below is the real guard.
         $order = wc_get_order( (int) $object_id );
         if ( ! $order instanceof WC_Order ) {
             return;
         }
+
+        $this->maybe_debug_log( sprintf( '[OC Giorgio] cardcom meta saved (postmeta hook). order_id=%d meta_key=%s', (int) $object_id, (string) $meta_key ) );
+        $this->process_cardcom_meta_present_for_order( $order, 'postmeta_hook' );
+    }
+
+    /**
+     * HPOS-safe complementary trigger. Under custom order tables the postmeta hooks do not fire for
+     * order meta, so we also re-check whenever an order is saved. Cheap no-op unless a Cardcom deal
+     * number is present on the order. Guarded against re-entrancy from our own meta saves.
+     *
+     * @param int            $order_id Order ID.
+     * @param WC_Order|mixed $order    Order instance (passed by recent WooCommerce).
+     */
+    public function maybe_trigger_after_order_save_for_cardcom( $order_id, $order = null ) {
+        $order_id = (int) $order_id;
+        if ( $order_id < 1 ) {
+            return;
+        }
+        if ( ! empty( self::$cardcom_order_save_trigger_running[ $order_id ] ) ) {
+            return;
+        }
+        if ( ! $order instanceof WC_Order ) {
+            $order = wc_get_order( $order_id );
+        }
+        if ( ! $order instanceof WC_Order ) {
+            return;
+        }
+
+        $deal = trim( (string) $order->get_meta( self::META_CARDCOM_PAYMENT_ID, true ) );
+        if ( '' === $deal ) {
+            $deal = trim( (string) $order->get_meta( self::META_CARDCOM_INTERNAL_DEAL_NUMBER, true ) );
+        }
+        if ( '' === $deal || '0' === $deal ) {
+            return; // No Cardcom transaction yet — nothing to trigger.
+        }
+
+        self::$cardcom_order_save_trigger_running[ $order_id ] = true;
+        try {
+            $this->process_cardcom_meta_present_for_order( $order, 'order_save_hook' );
+        } finally {
+            unset( self::$cardcom_order_save_trigger_running[ $order_id ] );
+        }
+    }
+
+    /**
+     * Shared logic once a Cardcom transaction id is known to exist on the order:
+     * (1) send the outgoing Order to Giorgio if the order sits at its trigger status and is not yet synced;
+     * (2) send the OrderPayment v2 webhook when the order is completed.
+     * Both downstream calls are independently de-duplicated, so invoking this from several hooks is safe.
+     *
+     * @param WC_Order $order  Order.
+     * @param string   $source Label for logging (which hook called).
+     */
+    protected function process_cardcom_meta_present_for_order( WC_Order $order, $source = '' ) {
+        if ( ! $order instanceof WC_Order ) {
+            return;
+        }
+        $order_id = $order->get_id();
 
         $trigger = $this->get_effective_send_order_to_storeos_status_for_order( $order );
         if ( '' !== (string) $trigger
@@ -190,16 +294,13 @@ class OC_StoreOS_Integration {
             $this->oc_storeos_wc_log(
                 'info',
                 sprintf(
-                    'Outgoing Order: Cardcom meta saved — triggering order sync. order_id=%d meta_key=%s status=%s trigger=%s',
-                    (int) $object_id,
-                    (string) $meta_key,
+                    'Outgoing Order: Cardcom transaction present — triggering order sync. order_id=%d status=%s trigger=%s source=%s',
+                    (int) $order_id,
                     (string) $order->get_status(),
-                    (string) $trigger
+                    (string) $trigger,
+                    (string) $source
                 ),
-                array(
-                    'order_id' => (int) $object_id,
-                    'meta_key' => (string) $meta_key,
-                )
+                array( 'order_id' => (int) $order_id )
             );
             $this->send_outgoing_when_order_enters( $order );
         }
@@ -208,14 +309,11 @@ class OC_StoreOS_Integration {
             $this->oc_storeos_wc_log(
                 'info',
                 sprintf(
-                    'OrderPayment v2: Cardcom meta saved after completion — triggering dispatch. order_id=%d meta_key=%s',
-                    (int) $object_id,
-                    (string) $meta_key
+                    'OrderPayment v2: Cardcom transaction present on completed order — triggering dispatch. order_id=%d source=%s',
+                    (int) $order_id,
+                    (string) $source
                 ),
-                array(
-                    'order_id' => (int) $object_id,
-                    'meta_key' => (string) $meta_key,
-                )
+                array( 'order_id' => (int) $order_id )
             );
             $this->maybe_send_order_payment_webhook_v2( $order );
         }
@@ -238,12 +336,12 @@ class OC_StoreOS_Integration {
         if ( (int) $order->get_meta( self::META_SYNCED, true ) === 1 ) {
             return;
         }
-        error_log( sprintf( '[OC StoreOS] Outgoing Order: scheduled retry running. order_id=%d status=%s', (int) $order_id, (string) $order->get_status() ) );
+        $this->maybe_debug_log( sprintf( '[OC Giorgio] Outgoing Order: scheduled retry running. order_id=%d status=%s', (int) $order_id, (string) $order->get_status() ) );
         $this->send_outgoing_when_order_enters( $order );
     }
 
     /**
-     * Improve formatted billing address preview for StoreOS-created orders.
+     * Improve formatted billing address preview for Giorgio-created orders.
      *
      * @param string   $formatted The current formatted address string.
      * @param WC_Order $order     Order object.
@@ -284,7 +382,7 @@ class OC_StoreOS_Integration {
     }
 
     /**
-     * Improve formatted shipping address preview for StoreOS-created orders.
+     * Improve formatted shipping address preview for Giorgio-created orders.
      *
      * @param string   $formatted The current formatted address string.
      * @param WC_Order $order     Order object.
@@ -334,35 +432,39 @@ class OC_StoreOS_Integration {
      * Register REST API routes.
      */
     public function register_rest_routes() {
-        register_rest_route(
-            'oc-storeos/v1',
-            '/orders',
-            array(
-                'methods'             => WP_REST_Server::CREATABLE,
-                'callback'            => array( $this, 'rest_create_order' ),
-                'permission_callback' => '__return_true',
-            )
-        );
+        // Register the order endpoints under the new brand namespace AND the legacy namespace,
+        // so Giorgio's existing calls keep working until its backend is pointed at the new one.
+        foreach ( array( self::REST_NAMESPACE, self::REST_NAMESPACE_LEGACY ) as $ns ) {
+            register_rest_route(
+                $ns,
+                '/orders',
+                array(
+                    'methods'             => WP_REST_Server::CREATABLE,
+                    'callback'            => array( $this, 'rest_create_order' ),
+                    'permission_callback' => array( $this, 'rest_check_incoming_auth' ),
+                )
+            );
 
-        register_rest_route(
-            'oc-storeos/v1',
-            '/default-closing-dates',
-            array(
-                'methods'             => WP_REST_Server::CREATABLE,
-                'callback'            => array( $this, 'rest_update_default_closing_dates' ),
-                'permission_callback' => '__return_true',
-                'args'                => array(),
-            )
-        );
+            register_rest_route(
+                $ns,
+                '/default-closing-dates',
+                array(
+                    'methods'             => WP_REST_Server::CREATABLE,
+                    'callback'            => array( $this, 'rest_update_default_closing_dates' ),
+                    'permission_callback' => array( $this, 'rest_check_incoming_auth' ),
+                    'args'                => array(),
+                )
+            );
+        }
 
-        // StoreOS product labels probe (used by external product sync).
+        // Giorgio product labels probe (used by external product sync).
         register_rest_route(
             'ed/v1',
             '/capabilities',
             array(
                 'methods'             => WP_REST_Server::READABLE,
                 'callback'            => array( $this, 'rest_ed_capabilities' ),
-                'permission_callback' => '__return_true',
+                'permission_callback' => array( $this, 'rest_check_incoming_auth' ),
             )
         );
 
@@ -372,9 +474,130 @@ class OC_StoreOS_Integration {
             array(
                 'methods'             => WP_REST_Server::READABLE,
                 'callback'            => array( $this, 'rest_ed_wolt' ),
-                'permission_callback' => '__return_true',
+                'permission_callback' => array( $this, 'rest_check_incoming_auth' ),
             )
         );
+    }
+
+    /**
+     * Permission callback for every inbound Giorgio/Giorgio REST route.
+     *
+     * Compares a shared secret (option `incoming_api_token`) against the request token, read from
+     * {@see HEADER_INCOMING_TOKEN}, `X-Api-Key`, or `Authorization: Bearer <token>` (first match wins).
+     * Comparison is constant-time ({@see hash_equals}).
+     *
+     * Behavior is staged via option `incoming_auth_mode` so updating a live site never breaks the
+     * integration before Giorgio starts sending the header:
+     * - off     → always allow (legacy). No checking, no log.
+     * - log     → always allow, but record the auth result so the rollout can be verified.
+     * - enforce → reject with 401 when a secret is configured and the token is missing/wrong.
+     *             If no secret is configured yet, allow + log a warning (fail-open while unconfigured,
+     *             so enforce can never lock Giorgio out by accident).
+     *
+     * @param WP_REST_Request $request Request.
+     * @return true|WP_Error True to allow; WP_Error (401) to block.
+     */
+    public function rest_check_incoming_auth( $request ) {
+        $options   = $this->get_options();
+        $mode      = isset( $options['incoming_auth_mode'] ) ? (string) $options['incoming_auth_mode'] : self::INCOMING_AUTH_MODE_OFF;
+        $expected  = isset( $options['incoming_api_token'] ) ? (string) $options['incoming_api_token'] : '';
+        if ( ! in_array( $mode, array( self::INCOMING_AUTH_MODE_OFF, self::INCOMING_AUTH_MODE_LOG, self::INCOMING_AUTH_MODE_ENFORCE ), true ) ) {
+            $mode = self::INCOMING_AUTH_MODE_OFF;
+        }
+
+        // Escape hatch (e.g. to allow an external WAF/mTLS layer to own auth instead).
+        if ( true === apply_filters( 'oc_storeos_bypass_incoming_auth', false, $request ) ) {
+            return true;
+        }
+
+        // Mode "off": preserve legacy behavior exactly — no checking, no logging.
+        if ( self::INCOMING_AUTH_MODE_OFF === $mode ) {
+            return true;
+        }
+
+        $presented   = $this->get_presented_incoming_token( $request );
+        $has_secret  = ( '' !== $expected );
+        $has_token   = ( '' !== $presented );
+        $matched     = ( $has_secret && $has_token && hash_equals( $expected, $presented ) );
+
+        $route       = method_exists( $request, 'get_route' ) ? (string) $request->get_route() : '';
+        $remote_ip   = function_exists( 'rest_get_ip_address' )
+            ? rest_get_ip_address()
+            : ( isset( $_SERVER['REMOTE_ADDR'] ) ? sanitize_text_field( wp_unslash( $_SERVER['REMOTE_ADDR'] ) ) : '' );
+
+        $this->log_rest_incoming_order( array(
+            'time_utc'   => gmdate( 'c' ),
+            'remote_ip'  => $remote_ip,
+            'result'     => 'auth',
+            'route'      => $route,
+            'mode'       => $mode,
+            'has_secret' => $has_secret ? 'yes' : 'no',
+            'has_token'  => $has_token ? 'yes' : 'no',
+            'matched'    => $matched ? 'yes' : 'no',
+        ) );
+
+        // Mode "log": never block — only observe. Lets you confirm Giorgio sends the header correctly
+        // before flipping to "enforce".
+        if ( self::INCOMING_AUTH_MODE_LOG === $mode ) {
+            return true;
+        }
+
+        // Mode "enforce".
+        if ( ! $has_secret ) {
+            // Fail-open while unconfigured so "enforce" can't accidentally lock the integration out.
+            $this->oc_storeos_wc_log(
+                'warning',
+                sprintf( 'Inbound auth: enforce mode but no incoming_api_token configured — allowing request. route=%s ip=%s', $route, $remote_ip ),
+                array( 'route' => $route )
+            );
+            return true;
+        }
+
+        if ( $matched ) {
+            return true;
+        }
+
+        $this->oc_storeos_wc_log(
+            'notice',
+            sprintf( 'Inbound auth: rejected request (token missing/invalid). route=%s ip=%s has_token=%s', $route, $remote_ip, $has_token ? 'yes' : 'no' ),
+            array( 'route' => $route )
+        );
+
+        return new WP_Error(
+            'oc_storeos_unauthorized',
+            __( 'Unauthorized.', 'oc-storeos-integration' ),
+            array( 'status' => 401 )
+        );
+    }
+
+    /**
+     * Read the inbound shared secret from the request headers.
+     * Order of precedence: {@see HEADER_INCOMING_TOKEN}, then `X-Api-Key`, then `Authorization: Bearer <token>`.
+     *
+     * @param WP_REST_Request $request Request.
+     * @return string Token string, or '' when none is present.
+     */
+    protected function get_presented_incoming_token( $request ) {
+        if ( ! ( $request instanceof WP_REST_Request ) ) {
+            return '';
+        }
+
+        $token = (string) $request->get_header( self::HEADER_INCOMING_TOKEN );
+        if ( '' !== trim( $token ) ) {
+            return trim( $token );
+        }
+
+        $token = (string) $request->get_header( 'X-Api-Key' );
+        if ( '' !== trim( $token ) ) {
+            return trim( $token );
+        }
+
+        $auth = (string) $request->get_header( 'Authorization' );
+        if ( '' !== trim( $auth ) && stripos( $auth, 'Bearer ' ) === 0 ) {
+            return trim( substr( $auth, 7 ) );
+        }
+
+        return '';
     }
 
     /**
@@ -661,10 +884,10 @@ class OC_StoreOS_Integration {
     }
 
     /**
-     * הוספת שורת מוצר מ־REST StoreOS עם subtotal/total מה־payload כשקיימים (אחרת קטלוג × כמות).
+     * הוספת שורת מוצר מ־REST Giorgio עם subtotal/total מה־payload כשקיימים (אחרת קטלוג × כמות).
      *
      * ברירת מחדל: lineTotal / unitPrice כולל מחיר נטו (ללא מע״מ), כמו ב־payload היוצא. פילטר:
-     * `oc_storeos_rest_item_line_amount_includes_tax` — החזיר true כשהסכום מה־StoreOS כולל מע״מ.
+     * `oc_storeos_rest_item_line_amount_includes_tax` — החזיר true כשהסכום מה־Giorgio כולל מע״מ.
      *
      * @param WC_Order   $order        Order.
      * @param WC_Product $product      מוצר שזוהה.
@@ -770,7 +993,7 @@ class OC_StoreOS_Integration {
 
     /**
      * Whether an incoming REST payload status slug should be applied to the WooCommerce order.
-     * Default: skip `processing` (typically shown as "בטיפול" in Hebrew admin) so StoreOS does not overwrite local handling status.
+     * Default: skip `processing` (typically shown as "בטיפול" in Hebrew admin) so Giorgio does not overwrite local handling status.
      *
      * Filter: `oc_storeos_rest_incoming_status_updates_skip_slugs` — array of WC status slugs (no `wc-` prefix) to ignore.
      *
@@ -871,7 +1094,7 @@ class OC_StoreOS_Integration {
             $deferred_wc_status     = null;
 
             // אם נשלח order_id / orderId / orderNumber – ננסה לעדכן הזמנה קיימת במקום ליצור חדשה.
-            // (orderNumber — מפתח כמו ב-payload מול StoreOS; בפלגין היוצא orderNumber הוא get_id().)
+            // (orderNumber — מפתח כמו ב-payload מול Giorgio; בפלגין היוצא orderNumber הוא get_id().)
             $incoming_order_id = 0;
             if ( ! empty( $data['order_id'] ) && is_numeric( $data['order_id'] ) ) {
                 $incoming_order_id = (int) $data['order_id'];
@@ -911,7 +1134,7 @@ class OC_StoreOS_Integration {
                 foreach ( $order->get_items() as $item_id => $item ) {
                     $order->remove_item( $item_id );
                 }
-                // משלוח: בעדכון הזמנה קיימת לא מסירים שורות משלוח — סנכרון StoreOS לא יכול להשאיר הזמנה בלי שיטת משלוח.
+                // משלוח: בעדכון הזמנה קיימת לא מסירים שורות משלוח — סנכרון Giorgio לא יכול להשאיר הזמנה בלי שיטת משלוח.
             }
 
             // 1. פרטי לקוח וחיוב
@@ -988,7 +1211,7 @@ class OC_StoreOS_Integration {
                     if ( ! is_array( $item ) ) {
                         continue;
                     }
-                    $identifier = ! empty( $item['sku'] ) ? (string) $item['sku'] : (string) $item['productId'];
+                    $identifier = ! empty( $item['sku'] ) ? (string) $item['sku'] : (string) ( $item['productId'] ?? '' );
                     $quantity   = isset( $item['quantity'] ) ? (float) $item['quantity'] : 0;
                     if ( $quantity <= 0 ) {
                         continue;
@@ -1079,7 +1302,7 @@ class OC_StoreOS_Integration {
                 $order->update_meta_data( '_oc_storeos_external_order_id', sanitize_text_field( (string) $data['externalOrderId'] ) );
             }
 
-            // שיטת תשלום מ־StoreOS (חובה לפלאקארד/קארדקום לפני מעבר ל־completed): paymentMethod | paymentMethodId | wcPaymentMethod
+            // שיטת תשלום מ־Giorgio (חובה לפלאקארד/קארדקום לפני מעבר ל־completed): paymentMethod | paymentMethodId | wcPaymentMethod
             $this->apply_payment_method_from_storeos_payload( $order, $data );
 
             if ( $updating_existing && null !== $deferred_wc_status && '' !== $deferred_wc_status ) {
@@ -1089,8 +1312,60 @@ class OC_StoreOS_Integration {
             $order->calculate_totals();
             $order->save(); // כאן הכל נשמר ב-Database בפעם אחת
 
-            // עדכון קיים שנדחף מ-StoreOS ל-Woo: לא לשגר שוב Order ל-StoreOS.
-            // אחרת נוצר ping-pong (Woo → StoreOS → push שוב ל-Woo) והצפת הערות + שינויי סטטוס.
+            // --- בדיקת התאמה: סכומים ופריטים -------------------------------------------
+            // Giorgio שולח מחירים ברוטו (כולל מע"מ): orderTotal הוא הסכום שהלקוח משלם.
+            // נשווה אותו מול הסכום ש-WooCommerce חישב אחרי השמירה. פער בדרך כלל אומר:
+            // (א) הגדרת המע"מ של החנות הוסיפה/הורידה מע"מ מעל הסכומים שנשלחו, או
+            // (ב) פריט נשמט בשקט כי ה-SKU/productId לא נפתר למוצר.
+            // לא מתקנים אוטומטית את הסכום (זה היה מסתיר באג קונפיגורציה אמיתי) — רק חושפים בקול.
+            $expected_total = ( isset( $data['orderTotal'] ) && is_numeric( $data['orderTotal'] ) ) ? round( (float) $data['orderTotal'], 2 ) : null;
+            $actual_total   = round( (float) $order->get_total(), 2 );
+            $totals_match   = ( null === $expected_total ) ? null : ( abs( $expected_total - $actual_total ) < 0.01 );
+
+            // Item-count differences are normal business, NOT an error: the shop manager may remove an
+            // unavailable item (after telling the customer) or add items that weren't in the original
+            // order. Giorgio recomputes orderTotal to match, so the TOTAL is the source of truth — not
+            // the item count. We therefore base "ok" purely on whether the totals reconcile; unresolved
+            // items are reported for visibility but never raise an alert on their own.
+            $reconciliation = array(
+                'ok'              => ( false !== $totals_match ), // true unless the totals definitively diverge
+                'expectedTotal'   => $expected_total,
+                'actualTotal'     => $actual_total,
+                'totalsMatch'     => $totals_match,
+                'itemsExpected'   => $items_eligible,
+                'itemsAdded'      => $items_added,
+                'itemsUnresolved' => array_values( array_map( 'strval', $items_unresolved_keys ) ),
+            );
+
+            if ( ! $reconciliation['ok'] ) {
+                $this->oc_storeos_wc_log(
+                    'warning',
+                    sprintf(
+                        'Reconciliation mismatch on order %d: expectedTotal=%s actualTotal=%s itemsExpected=%d itemsAdded=%d unresolved=[%s]',
+                        (int) $order->get_id(),
+                        ( null === $expected_total ? 'n/a' : (string) $expected_total ),
+                        (string) $actual_total,
+                        (int) $items_eligible,
+                        (int) $items_added,
+                        implode( ',', array_map( 'strval', $items_unresolved_keys ) )
+                    ),
+                    array( 'order_id' => (int) $order->get_id() )
+                );
+                $order->add_order_note(
+                    sprintf(
+                        /* translators: 1: amount Giorgio sent, 2: amount WooCommerce computed, 3: unresolved skus. */
+                        __( '⚠ אי-התאמה בסכום סנכרון Giorgio: סכום שנשלח %1$s ₪, סכום שחושב ב-Woo %2$s ₪. לבדוק הגדרת מע"מ בחנות%3$s.', 'oc-storeos-integration' ),
+                        ( null === $expected_total ? '—' : number_format( (float) $expected_total, 2 ) ),
+                        number_format( (float) $actual_total, 2 ),
+                        ( empty( $items_unresolved_keys ) ? '' : sprintf( __( ' (פריטים שלא נמצאו בקטלוג: %s)', 'oc-storeos-integration' ), implode( ', ', array_map( 'strval', $items_unresolved_keys ) ) ) )
+                    ),
+                    false,
+                    false
+                );
+            }
+
+            // עדכון קיים שנדחף מ-Giorgio ל-Woo: לא לשגר שוב Order ל-Giorgio.
+            // אחרת נוצר ping-pong (Woo → Giorgio → push שוב ל-Woo) והצפת הערות + שינויי סטטוס.
             if ( $updating_existing ) {
                 $outgoing_sync = array(
                     'skipped' => true,
@@ -1103,7 +1378,7 @@ class OC_StoreOS_Integration {
                 );
             }
 
-            // סיכום ללקוח API: נוצרה vs עודכנה, וסטטוס סנכרון ל-StoreOS (או דילוג/שגיאה).
+            // סיכום ללקוח API: נוצרה vs עודכנה, וסטטוס סנכרון ל-Giorgio (או דילוג/שגיאה).
             $storeos_sync_summary = array(
                 'status' => 'skipped',
             );
@@ -1126,10 +1401,10 @@ class OC_StoreOS_Integration {
                         }
                         if ( empty( $storeos_sync_summary['error'] ) && isset( $r['http_status'] ) && $r['http_status'] > 0 ) {
                             /* translators: %d: HTTP status code. */
-                            $storeos_sync_summary['error'] = sprintf( __( 'HTTP %d from StoreOS.', 'oc-storeos-integration' ), (int) $r['http_status'] );
+                            $storeos_sync_summary['error'] = sprintf( __( 'HTTP %d from Giorgio.', 'oc-storeos-integration' ), (int) $r['http_status'] );
                         }
                         if ( empty( $storeos_sync_summary['error'] ) ) {
-                            $storeos_sync_summary['error'] = __( 'StoreOS request failed.', 'oc-storeos-integration' );
+                            $storeos_sync_summary['error'] = __( 'Giorgio request failed.', 'oc-storeos-integration' );
                         }
                     }
                 }
@@ -1145,7 +1420,7 @@ class OC_StoreOS_Integration {
                     && ! empty( $storeos_sync_summary['reason'] )
                     && 'incoming_rest_update_no_outgoing_echo' === $storeos_sync_summary['reason']
                 ) {
-                    $sync_note = __( 'לא נשלח חוזר ל-StoreOS (מניעת לולאת סנכרון)', 'oc-storeos-integration' );
+                    $sync_note = __( 'לא נשלח חוזר ל-Giorgio (מניעת לולאת סנכרון)', 'oc-storeos-integration' );
                 } else {
                     $sync_note = (string) $storeos_sync_summary['status'];
                     if ( 'error' === $storeos_sync_summary['status'] && ! empty( $storeos_sync_summary['error'] ) ) {
@@ -1153,8 +1428,8 @@ class OC_StoreOS_Integration {
                     }
                 }
                 $order_note_text = sprintf(
-                /* translators: 1: items with qty>0 in payload, 2: products added as line items, 3: line items on order after save, 4: StoreOS sync summary. */
-                    __( 'עודכן דרך OC StoreOS REST API. פריטים בבקשה (כמות>0): %1$d, נוספו כמוצר מהקטלוג: %2$d, שורות מוצר בהזמנה אחרי שמירה: %3$d. סנכרון StoreOS: %4$s', 'oc-storeos-integration' ),
+                /* translators: 1: items with qty>0 in payload, 2: products added as line items, 3: line items on order after save, 4: Giorgio sync summary. */
+                    __( 'עודכן דרך OC Giorgio REST API. פריטים בבקשה (כמות>0): %1$d, נוספו כמוצר מהקטלוג: %2$d, שורות מוצר בהזמנה אחרי שמירה: %3$d. סנכרון Giorgio: %4$s', 'oc-storeos-integration' ),
                     $items_eligible,
                     $items_added,
                     $line_items_after,
@@ -1183,6 +1458,7 @@ class OC_StoreOS_Integration {
                     'line_items_after_save' => $line_items_after,
                     'items_all_saved'       => ( 0 === $items_eligible ) ? null : ( $items_added === $items_eligible ),
                     'items_unresolved'      => $items_unresolved_keys,
+                    'reconciliation'        => $reconciliation,
                     'storeos_sync'          => $storeos_sync_summary,
                     'http_response'         => $http_status,
                 )
@@ -1193,6 +1469,7 @@ class OC_StoreOS_Integration {
                     'success'         => true,
                     'orderOperation'  => $updating_existing ? 'updated' : 'created',
                     'storeosSync'     => $storeos_sync_summary,
+                    'reconciliation'  => $reconciliation,
                     'orderId'         => $order->get_id(),
                     'orderKey'        => $order->get_order_key(),
                     'status'          => $order->get_status(),
@@ -1215,7 +1492,7 @@ class OC_StoreOS_Integration {
     }
 
     /**
-     * Set WC payment method from StoreOS REST body when a registered gateway id is sent.
+     * Set WC payment method from Giorgio REST body when a registered gateway id is sent.
      *
      * @param WC_Order $order Order.
      * @param array    $data  JSON body.
@@ -1287,7 +1564,7 @@ class OC_StoreOS_Integration {
     }
 
     /**
-     * Enrich OrderPayment v2 JSON with siteId, orderNumber, externalOrderId (StoreOS correlation).
+     * Enrich OrderPayment v2 JSON with siteId, orderNumber, externalOrderId (Giorgio correlation).
      *
      * @param WC_Order             $order   Order.
      * @param array<string, mixed> $payload Partial payload.
@@ -1328,6 +1605,45 @@ class OC_StoreOS_Integration {
     }
 
     /**
+     * Absolute path to the outgoing (WooCommerce → Giorgio) payload log file.
+     *
+     * @return string
+     */
+    protected function get_rest_outgoing_log_path() {
+        $upload = wp_upload_dir();
+        if ( empty( $upload['error'] ) && ! empty( $upload['basedir'] ) ) {
+            $dir = trailingslashit( $upload['basedir'] ) . self::REST_INCOMING_LOG_DIR;
+            if ( ! is_dir( $dir ) ) {
+                wp_mkdir_p( $dir );
+            }
+            return trailingslashit( $dir ) . self::REST_OUTGOING_LOG_FILE;
+        }
+
+        return trailingslashit( WP_CONTENT_DIR ) . self::REST_OUTGOING_LOG_FILE;
+    }
+
+    /**
+     * Append one JSON line to the outgoing payload log. Mirrors log_rest_incoming_order.
+     * Enabled by default; disable via the `oc_storeos_log_rest_outgoing_payload` filter.
+     *
+     * @param array $fields Record to log.
+     */
+    protected function log_rest_outgoing_order( $fields ) {
+        if ( ! apply_filters( 'oc_storeos_log_rest_outgoing_payload', true, $fields ) ) {
+            return;
+        }
+        $path = $this->get_rest_outgoing_log_path();
+        if ( ! $path ) {
+            return;
+        }
+        $line = wp_json_encode( $fields, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES );
+        if ( false === $line ) {
+            $line = '{"time_utc":"' . gmdate( 'c' ) . '","result":"log_encode_error"}';
+        }
+        @file_put_contents( $path, $line . "\n", FILE_APPEND | LOCK_EX );
+    }
+
+    /**
      * Append one JSON line (or error text) to the incoming REST log.
      *
      * @param array $fields Key-value row to log.
@@ -1345,7 +1661,7 @@ class OC_StoreOS_Integration {
     }
 
     /**
-     * Apply incoming shipping info (delivery / pickup) onto the order as OC StoreOS meta.
+     * Apply incoming shipping info (delivery / pickup) onto the order as OC Giorgio meta.
      *
      * Expected payload structure:
      *  'shippingInfo' => [
@@ -1492,13 +1808,26 @@ class OC_StoreOS_Integration {
     }
 
     /**
+     * Add a "Settings" link to the plugin row on the Plugins screen.
+     *
+     * @param array $links Existing action links.
+     * @return array
+     */
+    public function add_settings_action_link( $links ) {
+        $url           = admin_url( 'admin.php?page=oc-storeos-integration' );
+        $settings_link = '<a href="' . esc_url( $url ) . '">' . esc_html__( 'הגדרות', 'oc-storeos-integration' ) . '</a>';
+        array_unshift( $links, $settings_link );
+        return $links;
+    }
+
+    /**
      * Register settings page under WooCommerce menu.
      */
     public function register_settings_page() {
         add_submenu_page(
             'woocommerce',
-            __( 'OC StoreOS Integration', 'oc-storeos-integration' ),
-            __( 'OC StoreOS Integration', 'oc-storeos-integration' ),
+            __( 'OC Giorgio Integration', 'oc-storeos-integration' ),
+            __( 'OC Giorgio Integration', 'oc-storeos-integration' ),
             'manage_woocommerce',
             'oc-storeos-integration',
             array( $this, 'render_settings_page' )
@@ -1515,99 +1844,139 @@ class OC_StoreOS_Integration {
             array( $this, 'sanitize_options' )
         );
 
-        add_settings_section(
-            'oc_storeos_main_section',
-            __( 'API Settings', 'oc-storeos-integration' ),
-            '__return_false',
-            'oc-storeos-integration'
-        );
+        // Two tabs are rendered from two page slugs, but every field saves into the SAME option
+        // group (register_setting above), so saving is unchanged.
+        add_settings_section( 'oc_giorgio_conn', '', '__return_false', 'oc-giorgio-connection' );
+        add_settings_section( 'oc_giorgio_conn_advanced', __( 'מתקדם', 'oc-storeos-integration' ), '__return_false', 'oc-giorgio-connection' );
+        add_settings_section( 'oc_giorgio_orders', '', '__return_false', 'oc-giorgio-orders' );
+        add_settings_section( 'oc_giorgio_orders_fee', __( 'תוספת עגלה', 'oc-storeos-integration' ), '__return_false', 'oc-giorgio-orders' );
 
         add_settings_field(
             'api_base_url',
             __( 'API Base URL', 'oc-storeos-integration' ),
             array( $this, 'render_field_api_base_url' ),
-            'oc-storeos-integration',
-            'oc_storeos_main_section'
+            'oc-giorgio-connection',
+            'oc_giorgio_conn'
         );
 
         add_settings_field(
             'api_token',
             __( 'API Token / API Key', 'oc-storeos-integration' ),
             array( $this, 'render_field_api_token' ),
-            'oc-storeos-integration',
-            'oc_storeos_main_section'
+            'oc-giorgio-connection',
+            'oc_giorgio_conn'
         );
 
         add_settings_field(
             'site_id',
             __( 'Site ID (optional)', 'oc-storeos-integration' ),
             array( $this, 'render_field_site_id' ),
-            'oc-storeos-integration',
-            'oc_storeos_main_section'
+            'oc-giorgio-connection',
+            'oc_giorgio_conn'
+        );
+
+        add_settings_field(
+            'github_token',
+            __( 'GitHub Token (לעדכונים אוטומטיים מ-repo פרטי)', 'oc-storeos-integration' ),
+            array( $this, 'render_field_github_token' ),
+            'oc-giorgio-connection',
+            'oc_giorgio_conn_advanced'
+        );
+
+        add_settings_field(
+            'incoming_api_token',
+            __( 'טוקן לאימות בקשות נכנסות (Giorgio → אתר)', 'oc-storeos-integration' ),
+            array( $this, 'render_field_incoming_api_token' ),
+            'oc-giorgio-connection',
+            'oc_giorgio_conn'
+        );
+
+        add_settings_field(
+            'incoming_auth_mode',
+            __( 'מצב אכיפת אימות בכניסה', 'oc-storeos-integration' ),
+            array( $this, 'render_field_incoming_auth_mode' ),
+            'oc-giorgio-connection',
+            'oc_giorgio_conn'
+        );
+
+        add_settings_field(
+            'debug_logging',
+            __( 'לוג דיבאג (PHP error log)', 'oc-storeos-integration' ),
+            array( $this, 'render_field_debug_logging' ),
+            'oc-giorgio-connection',
+            'oc_giorgio_conn_advanced'
+        );
+
+        add_settings_field(
+            'debug_outgoing_email',
+            __( 'שליחת payload יוצא במייל (דיבאג)', 'oc-storeos-integration' ),
+            array( $this, 'render_field_debug_outgoing_email' ),
+            'oc-giorgio-connection',
+            'oc_giorgio_conn_advanced'
         );
 
         add_settings_field(
             'send_order_to_storeos_status',
-            __( 'ברירת מחדל: סטטוס לשליחת הזמנה ל־StoreOS', 'oc-storeos-integration' ),
+            __( 'ברירת מחדל: סטטוס לשליחת הזמנה ל־Giorgio', 'oc-storeos-integration' ),
             array( $this, 'render_field_send_order_to_storeos_status' ),
-            'oc-storeos-integration',
-            'oc_storeos_main_section'
+            'oc-giorgio-orders',
+            'oc_giorgio_orders'
         );
 
         add_settings_field(
             'send_order_payment_webhook_on_charge',
             __( 'עדכון תשלום בעת חיוב', 'oc-storeos-integration' ),
             array( $this, 'render_field_send_order_payment_webhook_on_charge' ),
-            'oc-storeos-integration',
-            'oc_storeos_main_section'
+            'oc-giorgio-orders',
+            'oc_giorgio_orders'
         );
 
         add_settings_field(
             'include_variation_in_line_title',
-            __( 'הוסף שם הוריאציה לכותרת (בשליחה ל־StoreOS)', 'oc-storeos-integration' ),
+            __( 'הוסף שם הוריאציה לכותרת (בשליחה ל־Giorgio)', 'oc-storeos-integration' ),
             array( $this, 'render_field_include_variation_in_line_title' ),
-            'oc-storeos-integration',
-            'oc_storeos_main_section'
+            'oc-giorgio-orders',
+            'oc_giorgio_orders'
         );
 
         add_settings_field(
             'order_total_fee_percent',
             __( 'תוספת באחוזים לסכום הזמנה', 'oc-storeos-integration' ),
             array( $this, 'render_field_order_total_fee_percent' ),
-            'oc-storeos-integration',
-            'oc_storeos_main_section'
+            'oc-giorgio-orders',
+            'oc_giorgio_orders_fee'
         );
 
         add_settings_field(
             'order_total_fee_cart_text',
             __( 'טקסט לעגלה', 'oc-storeos-integration' ),
             array( $this, 'render_field_order_total_fee_cart_text' ),
-            'oc-storeos-integration',
-            'oc_storeos_main_section'
+            'oc-giorgio-orders',
+            'oc_giorgio_orders_fee'
         );
 
         add_settings_field(
             'order_total_fee_tooltip',
             __( 'טקסט טולטיפ לתוספת', 'oc-storeos-integration' ),
             array( $this, 'render_field_order_total_fee_tooltip' ),
-            'oc-storeos-integration',
-            'oc_storeos_main_section'
+            'oc-giorgio-orders',
+            'oc_giorgio_orders_fee'
         );
 
         add_settings_field(
             'shipping_method_label_map',
             __( 'מיפוי שיטות משלוח לשם חיצוני', 'oc-storeos-integration' ),
             array( $this, 'render_field_shipping_method_label_map' ),
-            'oc-storeos-integration',
-            'oc_storeos_main_section'
+            'oc-giorgio-orders',
+            'oc_giorgio_orders'
         );
 
         add_settings_field(
             'payment_method_label_map',
             __( 'מיפוי שיטות תשלום (תווית + סטטוס לשליחת הזמנה)', 'oc-storeos-integration' ),
             array( $this, 'render_field_payment_method_label_map' ),
-            'oc-storeos-integration',
-            'oc_storeos_main_section'
+            'oc-giorgio-orders',
+            'oc_giorgio_orders'
         );
     }
 
@@ -1630,8 +1999,36 @@ class OC_StoreOS_Integration {
             $options['api_token'] = sanitize_text_field( $input['api_token'] );
         }
 
+        if ( isset( $input['github_token'] ) ) {
+            $options['github_token'] = sanitize_text_field( $input['github_token'] );
+        }
+
         if ( isset( $input['site_id'] ) ) {
             $options['site_id'] = sanitize_text_field( $input['site_id'] );
+        }
+
+        if ( isset( $input['incoming_api_token'] ) ) {
+            $options['incoming_api_token'] = sanitize_text_field( $input['incoming_api_token'] );
+        }
+
+        if ( isset( $input['incoming_auth_mode'] ) ) {
+            $mode = sanitize_key( $input['incoming_auth_mode'] );
+            $options['incoming_auth_mode'] = in_array(
+                $mode,
+                array( self::INCOMING_AUTH_MODE_OFF, self::INCOMING_AUTH_MODE_LOG, self::INCOMING_AUTH_MODE_ENFORCE ),
+                true
+            ) ? $mode : self::INCOMING_AUTH_MODE_OFF;
+        }
+
+        $options['debug_logging'] = isset( $input['debug_logging'] )
+            && ( '1' === (string) $input['debug_logging'] );
+
+        $options['debug_outgoing_email'] = isset( $input['debug_outgoing_email'] )
+            && ( '1' === (string) $input['debug_outgoing_email'] );
+
+        if ( isset( $input['debug_email_recipient'] ) ) {
+            $email = sanitize_email( $input['debug_email_recipient'] );
+            $options['debug_email_recipient'] = is_email( $email ) ? $email : '';
         }
 
         if ( isset( $input['send_order_to_storeos_status'] ) ) {
@@ -1786,7 +2183,13 @@ class OC_StoreOS_Integration {
         $defaults = array(
             'api_base_url'        => '',
             'api_token'           => '',
+            'github_token'        => '',
             'site_id'             => '',
+            'incoming_api_token'  => '',
+            'incoming_auth_mode'  => self::INCOMING_AUTH_MODE_OFF,
+            'debug_logging'         => false,
+            'debug_outgoing_email'  => false,
+            'debug_email_recipient' => '',
             'send_order_to_storeos_status' => 'processing',
             'send_order_payment_webhook_on_charge' => true,
             'order_total_fee_percent' => 0,
@@ -1868,7 +2271,7 @@ class OC_StoreOS_Integration {
     }
 
     /**
-     * Effective WooCommerce order status (slug, no wc- prefix) that triggers the first StoreOS Order sync, or
+     * Effective WooCommerce order status (slug, no wc- prefix) that triggers the first Giorgio Order sync, or
      * PAYMENT_METHOD_SEND_ORDER_STATUS_OFF to never sync for this order, for empty string when sync is off globally
      * and this method has no override.
      *
@@ -1918,7 +2321,7 @@ class OC_StoreOS_Integration {
 
         $options           = $this->get_options();
         $endpoint          = '';
-        $incoming_endpoint = rest_url( 'oc-storeos/v1/orders' );
+        $incoming_endpoint = rest_url( self::REST_NAMESPACE . '/orders' );
         $wc_keys_url       = admin_url( 'admin.php?page=wc-settings&tab=advanced&section=keys' );
 
         if ( ! empty( $options['api_base_url'] ) ) {
@@ -1926,152 +2329,91 @@ class OC_StoreOS_Integration {
         }
 
         ?>
-        <div class="wrap oc-storeos-settings">
-            <h1><?php esc_html_e( 'OC StoreOS Integration', 'oc-storeos-integration' ); ?></h1>
+        <div class="wrap oc-giorgio-settings">
+            <h1><?php esc_html_e( 'OC Giorgio Integration', 'oc-storeos-integration' ); ?></h1>
             <style>
-                .oc-storeos-settings .oc-storeos-grid {
-                    display: grid;
-                    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-                    gap: 16px;
-                    margin-top: 16px;
-                    margin-bottom: 24px;
-                }
-                .oc-storeos-settings .oc-storeos-card {
-                    background: #fff;
-                    border: 1px solid #ccd0d4;
-                    border-radius: 4px;
-                    padding: 16px;
-                    box-shadow: 0 1px 1px rgba(0,0,0,0.04);
-                }
-                .oc-storeos-settings .oc-storeos-card h2 {
-                    margin-top: 0;
-                    font-size: 16px;
-                }
-                .oc-storeos-settings code {
-                    font-family: Menlo, Monaco, Consolas, "Courier New", monospace;
-                }
-                .oc-storeos-settings pre {
-                    background: #f6f7f7;
-                    border: 1px solid #dcdcde;
-                    padding: 8px;
-                    max-height: 260px;
-                    overflow: auto;
-                    font-size: 12px;
-                }
-                .oc-storeos-settings .oc-storeos-form-card {
-                    max-width: 900px;
-                }
-                .oc-storeos-settings .oc-storeos-tooltip {
-                    display: inline-flex;
-                    align-items: center;
-                    justify-content: center;
-                    width: 18px;
-                    height: 18px;
-                    margin-right: 6px;
-                    vertical-align: middle;
-                    cursor: help;
-                    color: #2271b1;
-                }
+                .oc-giorgio-settings code { font-family: Menlo, Monaco, Consolas, "Courier New", monospace; }
+                .oc-giorgio-settings pre { background:#f6f7f7; border:1px solid #dcdcde; padding:8px; max-height:260px; overflow:auto; font-size:12px; }
+                .oc-giorgio-settings .oc-giorgio-panel { background:#fff; border:1px solid #ccd0d4; border-top:none; padding:6px 20px 2px; max-width:1000px; }
+                .oc-giorgio-settings .oc-giorgio-panel h2 { font-size:13px; text-transform:uppercase; letter-spacing:.04em; color:#646970; border-top:1px solid #e6e6e6; padding-top:16px; margin:22px 0 0; }
+                .oc-giorgio-settings details.oc-giorgio-details { margin:16px 0; background:#fbfbfc; border:1px solid #dcdcde; border-radius:4px; padding:10px 14px; max-width:1000px; }
+                .oc-giorgio-settings details.oc-giorgio-details > summary { cursor:pointer; font-weight:600; color:#2271b1; }
+                .oc-giorgio-settings details.oc-giorgio-details > .oc-giorgio-ref { margin-top:12px; }
+                /* on/off fields shown as toggle switches (the underlying input is still a checkbox, so saving is unchanged) */
+                .oc-giorgio-settings input[type="checkbox"].oc-toggle { -webkit-appearance:none; appearance:none; width:42px; height:22px; border-radius:22px; background:#c3c4c7; position:relative; cursor:pointer; transition:background .2s; vertical-align:middle; margin:0 4px; }
+                .oc-giorgio-settings input[type="checkbox"].oc-toggle:checked { background:#00A07A; }
+                .oc-giorgio-settings input[type="checkbox"].oc-toggle::before { content:""; position:absolute; top:2px; left:2px; width:18px; height:18px; border-radius:50%; background:#fff; transition:left .2s, right .2s; box-shadow:0 1px 2px rgba(0,0,0,.25); }
+                .oc-giorgio-settings input[type="checkbox"].oc-toggle:checked::before { left:22px; }
+                body.rtl .oc-giorgio-settings input[type="checkbox"].oc-toggle::before { left:auto; right:2px; }
+                body.rtl .oc-giorgio-settings input[type="checkbox"].oc-toggle:checked::before { right:22px; }
             </style>
-            <div class="oc-storeos-grid">
-                <div class="oc-storeos-card">
-                    <h2><?php esc_html_e( 'Outgoing orders → StoreOS', 'oc-storeos-integration' ); ?></h2>
-                    <?php if ( ! empty( $endpoint ) ) : ?>
-                        <p>
-                            <?php esc_html_e( 'Orders are currently sent to:', 'oc-storeos-integration' ); ?>
-                            <br />
-                            <code><?php echo esc_html( $endpoint ); ?></code>
-                        </p>
-                        <p>
-                            <?php esc_html_e( 'Example JSON payload sent to the external system:', 'oc-storeos-integration' ); ?>
-                        </p>
-                        <pre><code><?php
-                                echo esc_html(
-                                    wp_json_encode(
-                                        array(
-                                            'externalOrderId' => 12345,
-                                            'orderNumber'     => '12345',
-                                            'source'          => 'WooCommerce',
-                                            'siteId'          => 'site_001',
-                                            'status'          => 'on-hold',
-                                            'orderDate'       => '2026-03-05T12:30:00',
-                                            'customer'        => array(
-                                                'name'  => 'John Doe',
-                                                'phone' => '0501234567',
-                                                'email' => 'john@example.com',
-                                            ),
-                                            'shippingAddress' => array(
-                                                'street' => 'Herzl 10',
-                                                'city'   => 'Tel Aviv',
-                                                'zip'    => '61000',
-                                            ),
-                                            'items'           => array(
-                                                array(
-                                                    'productId' => 123,
-                                                    'name'      => 'Product Name',
-                                                    'quantity'  => 2,
-                                                    'unitPrice' => 50,
-                                                    'lineTotal' => 100,
-                                                ),
-                                            ),
-                                            'shippingTotal'   => 20,
-                                            'orderTotal'      => 120,
-                                            'customerNotes'   => 'Please call before delivery',
-                                        ),
-                                        JSON_PRETTY_PRINT
-                                    )
-                                );
-                                ?></code></pre>
-                    <?php else : ?>
-                        <p>
-                            <?php esc_html_e( 'Set the API Base URL below to see the full outgoing orders endpoint URL and example payload.', 'oc-storeos-integration' ); ?>
-                        </p>
-                    <?php endif; ?>
-                </div>
-                <div class="oc-storeos-card">
-                    <h2><?php esc_html_e( 'Incoming orders ← StoreOS', 'oc-storeos-integration' ); ?></h2>
-                    <p>
-                        <?php esc_html_e( 'To create orders in WooCommerce, the external system should POST to:', 'oc-storeos-integration' ); ?>
-                        <br />
-                        <code><?php echo esc_html( $incoming_endpoint ); ?></code>
-                    </p>
-                    <p>
-                        <?php esc_html_e( 'Example JSON payload:', 'oc-storeos-integration' ); ?>
-                    </p>
-                    <pre><code><?php echo esc_html( wp_json_encode( array(
-                                'status'  => 'on-hold',
+
+            <h2 class="nav-tab-wrapper">
+                <a href="#oc-giorgio-panel-connection" class="nav-tab nav-tab-active oc-giorgio-tab" data-panel="oc-giorgio-panel-connection"><?php esc_html_e( 'חיבור', 'oc-storeos-integration' ); ?></a>
+                <a href="#oc-giorgio-panel-orders" class="nav-tab oc-giorgio-tab" data-panel="oc-giorgio-panel-orders"><?php esc_html_e( 'הזמנות', 'oc-storeos-integration' ); ?></a>
+            </h2>
+
+            <form method="post" action="options.php">
+                <?php settings_fields( self::OPTION_GROUP ); ?>
+
+                <div id="oc-giorgio-panel-connection" class="oc-giorgio-panel">
+                    <?php do_settings_sections( 'oc-giorgio-connection' ); ?>
+
+                    <details class="oc-giorgio-details">
+                        <summary><?php esc_html_e( 'כתובות ודוגמאות JSON (למפתחים)', 'oc-storeos-integration' ); ?></summary>
+                        <div class="oc-giorgio-ref">
+                            <p>
+                                <?php esc_html_e( 'To create orders in WooCommerce, the external system should POST to:', 'oc-storeos-integration' ); ?>
+                                <br /><code><?php echo esc_html( $incoming_endpoint ); ?></code>
+                            </p>
+                            <?php if ( ! empty( $endpoint ) ) : ?>
+                                <p><?php esc_html_e( 'Outgoing orders are sent to:', 'oc-storeos-integration' ); ?><br /><code><?php echo esc_html( $endpoint ); ?></code></p>
+                                <p><?php esc_html_e( 'Example outgoing JSON payload:', 'oc-storeos-integration' ); ?></p>
+                                <pre><code><?php echo esc_html( wp_json_encode( array(
+                                    'externalOrderId' => 12345,
+                                    'orderNumber'     => '12345',
+                                    'source'          => 'WooCommerce',
+                                    'siteId'          => 'site_001',
+                                    'status'          => 'on-hold',
+                                    'customer'        => array( 'name' => 'John Doe', 'phone' => '0501234567', 'email' => 'john@example.com' ),
+                                    'items'           => array( array( 'productId' => 123, 'name' => 'Product Name', 'quantity' => 2, 'unitPrice' => 50, 'lineTotal' => 100 ) ),
+                                    'shippingTotal'   => 20,
+                                    'orderTotal'      => 120,
+                                ), JSON_PRETTY_PRINT ) ); ?></code></pre>
+                            <?php endif; ?>
+                            <p><?php esc_html_e( 'Example incoming JSON payload:', 'oc-storeos-integration' ); ?></p>
+                            <pre><code><?php echo esc_html( wp_json_encode( array(
+                                'status'          => 'on-hold',
                                 'externalOrderId' => 'EXT-12345',
-                                'customer'=> array(
-                                    'name'  => 'John Doe',
-                                    'phone' => '0501234567',
-                                    'email' => 'john@example.com',
-                                ),
-                                'shippingAddress' => array(
-                                    'street' => 'Herzl 10',
-                                    'city'   => 'Tel Aviv',
-                                    'zip'    => '61000',
-                                ),
-                                'items' => array(
-                                    array(
-                                        'sku'      => 'ABC-123',
-                                        'quantity' => 1,
-                                    ),
-                                ),
-                                'customerNotes' => 'Please call before delivery',
+                                'customer'        => array( 'name' => 'John Doe', 'phone' => '0501234567', 'email' => 'john@example.com' ),
+                                'items'           => array( array( 'sku' => 'ABC-123', 'quantity' => 1 ) ),
                             ), JSON_PRETTY_PRINT ) ); ?></code></pre>
+                        </div>
+                    </details>
                 </div>
-            </div>
-            <div class="oc-storeos-card oc-storeos-form-card">
-                <h2><?php esc_html_e( 'Integration settings', 'oc-storeos-integration' ); ?></h2>
-                <form method="post" action="options.php">
-                    <?php
-                    settings_fields( self::OPTION_GROUP );
-                    do_settings_sections( 'oc-storeos-integration' );
-                    submit_button();
-                    ?>
-                </form>
-            </div>
+
+                <div id="oc-giorgio-panel-orders" class="oc-giorgio-panel" style="display:none;">
+                    <?php do_settings_sections( 'oc-giorgio-orders' ); ?>
+                </div>
+
+                <?php submit_button(); ?>
+            </form>
         </div>
+        <script>
+        (function(){
+            var tabs = document.querySelectorAll('.oc-giorgio-tab');
+            tabs.forEach(function(tab){
+                tab.addEventListener('click', function(e){
+                    e.preventDefault();
+                    tabs.forEach(function(t){ t.classList.remove('nav-tab-active'); });
+                    document.querySelectorAll('.oc-giorgio-panel').forEach(function(p){ p.style.display='none'; });
+                    tab.classList.add('nav-tab-active');
+                    var panel = document.getElementById(tab.getAttribute('data-panel'));
+                    if (panel) { panel.style.display=''; }
+                });
+            });
+        })();
+        </script>
         <?php
     }
 
@@ -2105,6 +2447,28 @@ class OC_StoreOS_Integration {
     }
 
     /**
+     * Render GitHub Token field (used only for auto-updates from a private GitHub repo).
+     */
+    public function render_field_github_token() {
+        $options    = $this->get_options();
+        $via_const  = defined( 'OC_GIORGIO_GH_TOKEN' ) && OC_GIORGIO_GH_TOKEN;
+        $value      = isset( $options['github_token'] ) ? (string) $options['github_token'] : '';
+        ?>
+        <input type="password" class="regular-text" name="<?php echo esc_attr( self::OPTION_NAME ); ?>[github_token]"
+               value="<?php echo esc_attr( $value ); ?>" autocomplete="off" <?php disabled( $via_const ); ?> />
+        <p class="description">
+            <?php
+            if ( $via_const ) {
+                esc_html_e( 'מוגדר דרך קבוע OC_GIORGIO_GH_TOKEN ב-wp-config (גובר על השדה הזה).', 'oc-storeos-integration' );
+            } else {
+                esc_html_e( 'טוקן GitHub לקריאה בלבד (fine-grained, הרשאת Contents: Read על ה-repo בלבד). נחוץ רק כשה-repo פרטי, כדי שעדכונים אוטומטיים יעבדו. לא קשור ל-API של Giorgio.', 'oc-storeos-integration' );
+            }
+            ?>
+        </p>
+        <?php
+    }
+
+    /**
      * Render Site ID field.
      */
     public function render_field_site_id() {
@@ -2119,7 +2483,89 @@ class OC_StoreOS_Integration {
     }
 
     /**
-     * Render select: which WooCommerce order status triggers outgoing Order sync to StoreOS.
+     * Render the inbound shared-secret field (used to authenticate Giorgio → site REST calls).
+     */
+    public function render_field_incoming_api_token() {
+        $options = $this->get_options();
+        $value   = isset( $options['incoming_api_token'] ) ? (string) $options['incoming_api_token'] : '';
+        ?>
+        <input type="password" class="regular-text" id="oc_storeos_incoming_api_token"
+               name="<?php echo esc_attr( self::OPTION_NAME ); ?>[incoming_api_token]"
+               value="<?php echo esc_attr( $value ); ?>" autocomplete="off" />
+        <p class="description">
+            <?php esc_html_e( 'סוד משותף ש-Giorgio חייב לשלוח בכל בקשה נכנסת, באחת מהכותרות: X-OC-Giorgio-Token, או X-Api-Key, או Authorization: Bearer <token>. השתמש במחרוזת אקראית ארוכה (32+ תווים). זהו טוקן נפרד מ-API Token היוצא.', 'oc-storeos-integration' ); ?>
+        </p>
+        <?php
+    }
+
+    /**
+     * Render the inbound auth enforcement-mode selector (off / log / enforce).
+     */
+    public function render_field_incoming_auth_mode() {
+        $options = $this->get_options();
+        $current = isset( $options['incoming_auth_mode'] ) ? (string) $options['incoming_auth_mode'] : self::INCOMING_AUTH_MODE_OFF;
+        $name    = self::OPTION_NAME . '[incoming_auth_mode]';
+        $choices = array(
+            self::INCOMING_AUTH_MODE_OFF     => __( 'כבוי — ללא בדיקה (התנהגות נוכחית)', 'oc-storeos-integration' ),
+            self::INCOMING_AUTH_MODE_LOG     => __( 'לוג בלבד — בודק ומתעד, מעביר הכל (לבדיקה)', 'oc-storeos-integration' ),
+            self::INCOMING_AUTH_MODE_ENFORCE => __( 'אכיפה — חוסם בקשות עם טוקן חסר/שגוי (401)', 'oc-storeos-integration' ),
+        );
+        ?>
+        <select name="<?php echo esc_attr( $name ); ?>" id="oc_storeos_incoming_auth_mode">
+            <?php foreach ( $choices as $val => $label ) : ?>
+                <option value="<?php echo esc_attr( $val ); ?>" <?php selected( $current, $val ); ?>>
+                    <?php echo esc_html( $label ); ?>
+                </option>
+            <?php endforeach; ?>
+        </select>
+        <p class="description">
+            <?php esc_html_e( 'סדר הטמעה מומלץ: (1) הזן טוקן למעלה. (2) תאם עם המפתח של Giorgio שיתחיל לשלוח את הכותרת. (3) עבור ל״לוג בלבד״ ובדוק ביומן (WooCommerce → סטטוס → יומנים, מקור oc-storeos-integration) ש-matched=yes. (4) רק אז עבור ל״אכיפה״. הערה: ב״אכיפה״ ללא טוקן מוגדר — הבקשות עדיין יעברו, כדי שלא ננעל בטעות.', 'oc-storeos-integration' ); ?>
+        </p>
+        <?php
+    }
+
+    /**
+     * Render checkbox: verbose debug logging to the PHP error log.
+     */
+    public function render_field_debug_logging() {
+        $options = $this->get_options();
+        $on      = ! empty( $options['debug_logging'] );
+        $name    = self::OPTION_NAME . '[debug_logging]';
+        ?>
+        <input type="hidden" name="<?php echo esc_attr( $name ); ?>" value="0" />
+        <label>
+            <input type="checkbox" class="oc-toggle" name="<?php echo esc_attr( $name ); ?>" value="1" <?php checked( $on ); ?> />
+            <?php esc_html_e( 'כתוב שורות דיבאג מפורטות ל-PHP error log. כבוי בפרודקשן. (נדלק אוטומטית גם כש-WP_DEBUG פעיל.)', 'oc-storeos-integration' ); ?>
+        </label>
+        <?php
+    }
+
+    /**
+     * Render checkbox + recipient: email a copy of the outgoing payload for debugging.
+     */
+    public function render_field_debug_outgoing_email() {
+        $options   = $this->get_options();
+        $on        = ! empty( $options['debug_outgoing_email'] );
+        $recipient = isset( $options['debug_email_recipient'] ) ? (string) $options['debug_email_recipient'] : '';
+        $name      = self::OPTION_NAME . '[debug_outgoing_email]';
+        $rcpt_name = self::OPTION_NAME . '[debug_email_recipient]';
+        ?>
+        <input type="hidden" name="<?php echo esc_attr( $name ); ?>" value="0" />
+        <label>
+            <input type="checkbox" class="oc-toggle" name="<?php echo esc_attr( $name ); ?>" value="1" <?php checked( $on ); ?> />
+            <?php esc_html_e( 'שלח עותק של ה-payload היוצא במייל (לצרכי דיבאג בלבד). נשלחים שני מיילים להזמנת אשראי: AUTHORIZATION (הרשאה/J5) כשההזמנה נכנסת, ו-CAPTURE (תפיסה/חיוב) — כולל תשובת Giorgio — כשההזמנה מחויבת.', 'oc-storeos-integration' ); ?>
+        </label>
+        <br /><br />
+        <input type="email" class="regular-text" name="<?php echo esc_attr( $rcpt_name ); ?>"
+               value="<?php echo esc_attr( $recipient ); ?>" placeholder="<?php echo esc_attr( get_option( 'admin_email' ) ); ?>" />
+        <p class="description">
+            <?php esc_html_e( 'כתובת לקבלת עותקי הדיבאג. אם ריק — נשלח לכתובת מנהל האתר. שים לב: ה-payload כולל פרטי לקוח (שם, טלפון, מייל, כתובת), אז להשאיר כבוי בפרודקשן.', 'oc-storeos-integration' ); ?>
+        </p>
+        <?php
+    }
+
+    /**
+     * Render select: which WooCommerce order status triggers outgoing Order sync to Giorgio.
      */
     public function render_field_send_order_to_storeos_status() {
         $options  = $this->get_options();
@@ -2139,7 +2585,7 @@ class OC_StoreOS_Integration {
             <?php endforeach; ?>
         </select>
         <p class="description">
-            <?php esc_html_e( 'בחירת סטטוס ברירת מחדל: ההזמנה תישלח ל־StoreOS בפעם הראשונה שההזמנה עוברת לסטטוס הזה (בהתאם לשיטת התשלום — ר׳ הטבלה ״מיפוי שיטות תשלום״, עמודת סטטוס). אם לשיטה אין עקיפה בטבלה, משתמשים בערך כאן. לא נשלח מיד ביצירת ההזמנה. עדכון תשלום (OrderPayment) נשאר בהגדרה נפרדת למטה.', 'oc-storeos-integration' ); ?>
+            <?php esc_html_e( 'בחירת סטטוס ברירת מחדל: ההזמנה תישלח ל־Giorgio בפעם הראשונה שההזמנה עוברת לסטטוס הזה (בהתאם לשיטת התשלום — ר׳ הטבלה ״מיפוי שיטות תשלום״, עמודת סטטוס). אם לשיטה אין עקיפה בטבלה, משתמשים בערך כאן. לא נשלח מיד ביצירת ההזמנה. עדכון תשלום (OrderPayment) נשאר בהגדרה נפרדת למטה.', 'oc-storeos-integration' ); ?>
         </p>
         <?php
     }
@@ -2154,17 +2600,17 @@ class OC_StoreOS_Integration {
         ?>
         <input type="hidden" name="<?php echo esc_attr( $name ); ?>" value="0" />
         <label>
-            <input type="checkbox" name="<?php echo esc_attr( $name ); ?>" value="1" <?php checked( $on ); ?> />
-            <?php esc_html_e( 'שלח ל־StoreOS עדכון תשלום (OrderPayment) מיד כשהחיוב ב־Woo עובר (Payment complete).', 'oc-storeos-integration' ); ?>
+            <input type="checkbox" class="oc-toggle" name="<?php echo esc_attr( $name ); ?>" value="1" <?php checked( $on ); ?> />
+            <?php esc_html_e( 'שלח ל־Giorgio עדכון תשלום (OrderPayment) מיד כשהחיוב ב־Woo עובר (Payment complete).', 'oc-storeos-integration' ); ?>
         </label>
         <p class="description">
-            <?php esc_html_e( 'כבוי = לא יישלח בעת החיוב בלבד. שינוי סטטוס ההזמנה ל״הושלמה״ עדיין ישלח עדכון תשלום ל־StoreOS.', 'oc-storeos-integration' ); ?>
+            <?php esc_html_e( 'כבוי = לא יישלח בעת החיוב בלבד. שינוי סטטוס ההזמנה ל״הושלמה״ עדיין ישלח עדכון תשלום ל־Giorgio.', 'oc-storeos-integration' ); ?>
         </p>
         <?php
     }
 
     /**
-     * Render checkbox: include variation text in line item "name" sent to StoreOS.
+     * Render checkbox: include variation text in line item "name" sent to Giorgio.
      */
     public function render_field_include_variation_in_line_title() {
         $options = $this->get_options();
@@ -2174,7 +2620,7 @@ class OC_StoreOS_Integration {
         ?>
         <input type="hidden" name="<?php echo esc_attr( $name ); ?>" value="0" />
         <label>
-            <input type="checkbox" name="<?php echo esc_attr( $name ); ?>" value="1" <?php checked( $on ); ?> />
+            <input type="checkbox" class="oc-toggle" name="<?php echo esc_attr( $name ); ?>" value="1" <?php checked( $on ); ?> />
             <?php esc_html_e( 'מסומן: שם השורה כמו ב־WooCommerce (כולל וריאציה בכותרת). לא מסומן: רק שם מוצר הבסיס (להוריאציה — שם המוצר ההורה). פרטי הוריאציה נשארים בשדה variation.', 'oc-storeos-integration' ); ?>
         </label>
         <?php
@@ -2255,7 +2701,7 @@ class OC_StoreOS_Integration {
     }
 
     /**
-     * StoreOS quantity semantics: quantityType (kg vs unit), optional unit count + unit weight for weighable sold-by-units.
+     * Giorgio quantity semantics: quantityType (kg vs unit), optional unit count + unit weight for weighable sold-by-units.
      *
      * @param WC_Order_Item_Product|mixed $item Order line item.
      * @return array{quantityType: string, unit: float|null, unitWeight: float|null}
@@ -2299,7 +2745,7 @@ class OC_StoreOS_Integration {
     }
 
     /**
-     * Order meta may store per-unit weight in grams (e.g. 500); StoreOS expects kg (0.5).
+     * Order meta may store per-unit weight in grams (e.g. 500); Giorgio expects kg (0.5).
      * Values greater than 10 are treated as grams and divided by 1000; otherwise left as kg.
      *
      * @param float $raw Raw value from _ocwsu_unit_weight.
@@ -2507,7 +2953,7 @@ class OC_StoreOS_Integration {
                 <th style="width:22%;"><?php esc_html_e( 'Payment Method ID', 'oc-storeos-integration' ); ?></th>
                 <th style="width:24%;"><?php esc_html_e( 'שם נוכחי באתר', 'oc-storeos-integration' ); ?></th>
                 <th style="width:28%;"><?php esc_html_e( 'Label לשליחה למערכת (paymentlabel)', 'oc-storeos-integration' ); ?></th>
-                <th style="width:26%;"><?php esc_html_e( 'סטטוס Woo לשליחת הזמנה ל־StoreOS (פעם ראשונה)', 'oc-storeos-integration' ); ?></th>
+                <th style="width:26%;"><?php esc_html_e( 'סטטוס Woo לשליחת הזמנה ל־Giorgio (פעם ראשונה)', 'oc-storeos-integration' ); ?></th>
             </tr>
             </thead>
             <tbody>
@@ -2547,7 +2993,7 @@ class OC_StoreOS_Integration {
             </tbody>
         </table>
         <p class="description">
-            <?php esc_html_e( 'מוצגות רק שיטות תשלום שמסומנות כפעילות ב־WooCommerce (הגדרות → תשלומים). בכל שורה: תווית לשדה paymentlabel, ואיזה סטטוס Woo יגרום לשליחת הזמנה מלאה ל־StoreOS בפעם הראשונה. אם מבחרים ״ברירת מחדל״ — נעשה שימוש בהגדרת ״ברירת מחדל: סטטוס לשליחת הזמנה״ למעלה.', 'oc-storeos-integration' ); ?>
+            <?php esc_html_e( 'מוצגות רק שיטות תשלום שמסומנות כפעילות ב־WooCommerce (הגדרות → תשלומים). בכל שורה: תווית לשדה paymentlabel, ואיזה סטטוס Woo יגרום לשליחת הזמנה מלאה ל־Giorgio בפעם הראשונה. אם מבחרים ״ברירת מחדל״ — נעשה שימוש בהגדרת ״ברירת מחדל: סטטוס לשליחת הזמנה״ למעלה.', 'oc-storeos-integration' ); ?>
         </p>
         <?php
     }
@@ -2928,7 +3374,7 @@ class OC_StoreOS_Integration {
      * @param WC_Order|null $order   Order.
      * @param array         $context Optional. `skip_status_gate` — for incoming REST echo (ignore WC status trigger).
      *
-     * @return array|null Skipped flags, or outgoingPayload + storeosHttpResponse from StoreOS.
+     * @return array|null Skipped flags, or outgoingPayload + storeosHttpResponse from Giorgio.
      */
     protected function send_outgoing_when_order_enters( $order, $context = array() ) {
         if ( ! $order instanceof WC_Order ) {
@@ -3001,7 +3447,7 @@ class OC_StoreOS_Integration {
     }
 
     /**
-     * POST order JSON to StoreOS when the "send order" option is enabled.
+     * POST order JSON to Giorgio when the "send order" option is enabled.
      *
      * @param WC_Order $order Order object.
      * 
@@ -3048,7 +3494,7 @@ class OC_StoreOS_Integration {
                 $tx = trim( (string) $order->get_meta( self::META_CARDCOM_INTERNAL_DEAL_NUMBER, true ) );
             }
             if ( '' === $tx || '0' === $tx ) {
-                error_log( sprintf( '[OC StoreOS] Outgoing Order: waiting_for_cardcom_transaction. order_id=%d status=%s trigger=%s', (int) $order->get_id(), (string) $order->get_status(), (string) $trigger ) );
+                $this->maybe_debug_log( sprintf( '[OC Giorgio] Outgoing Order: waiting_for_cardcom_transaction. order_id=%d status=%s trigger=%s', (int) $order->get_id(), (string) $order->get_status(), (string) $trigger ) );
                 // Don't block the current request; schedule a short retry to give Cardcom IPN time to persist meta.
                 if ( function_exists( 'wp_next_scheduled' ) && function_exists( 'wp_schedule_single_event' ) ) {
                     $hook = 'oc_storeos_retry_outgoing_order_after_cardcom_tx';
@@ -3062,13 +3508,13 @@ class OC_StoreOS_Integration {
                 );
             }
         }
-        error_log( sprintf( '[OC StoreOS] Outgoing Order: build_order_payload start. order_id=%d status=%s', (int) $order->get_id(), (string) $order->get_status() ) );
+        $this->maybe_debug_log( sprintf( '[OC Giorgio] Outgoing Order: build_order_payload start. order_id=%d status=%s', (int) $order->get_id(), (string) $order->get_status() ) );
         $payload = $this->build_order_payload( $order, $options );
         $payload_json = wp_json_encode( $payload ); 
         $this->oc_storeos_wc_log(
             'info',
             sprintf(
-                'Outgoing Order: sending order to StoreOS. order_id=%d payload_keys=%s',
+                'Outgoing Order: sending order to Giorgio. order_id=%d payload_keys=%s',
                 (int) $order->get_id(),
                 implode(',', array_keys($payload))
             ),
@@ -3084,7 +3530,7 @@ class OC_StoreOS_Integration {
         $payload_hash = md5( $payload_json );
         $dedup_key    = self::TRANSIENT_OUT_ORDER_HASH_PREFIX . (int) $order->get_id();
 
-        // אותה בקשת עדכון פעמיים (Polly, שני handlers, ריטרי מול WAF) → לא לשגר שוב אותו גוף ל-StoreOS.
+        // אותה בקשת עדכון פעמיים (Polly, שני handlers, ריטרי מול WAF) → לא לשגר שוב אותו גוף ל-Giorgio.
         if ( get_transient( $dedup_key ) === $payload_hash ) {
             return array(
                 'skipped' => true,
@@ -3093,9 +3539,9 @@ class OC_StoreOS_Integration {
         }
 
         $api_result = $this->send_order_to_api( $order, $payload, $options );
-        error_log(
+        $this->maybe_debug_log(
             sprintf(
-                '[OC StoreOS] Outgoing Order: send_order_to_api done. order_id=%d success=%s http=%s err_prefix=%s',
+                '[OC Giorgio] Outgoing Order: send_order_to_api done. order_id=%d success=%s http=%s err_prefix=%s',
                 (int) $order->get_id(),
                 ! empty( $api_result['success'] ) ? 'yes' : 'no',
                 isset( $api_result['http_status'] ) ? (string) $api_result['http_status'] : '',
@@ -3114,7 +3560,7 @@ class OC_StoreOS_Integration {
     }
 
     /**
-     * Line item title for StoreOS "name" field, per settings.
+     * Line item title for Giorgio "name" field, per settings.
      *
      * @param WC_Order_Item_Product $item    Order line item.
      * @param array                 $options Plugin options.
@@ -3164,7 +3610,7 @@ class OC_StoreOS_Integration {
     }
 
     /**
-     * Resolve shipping city for StoreOS: WC city may hold a place_id; prefer name meta and billing fallback.
+     * Resolve shipping city for Giorgio: WC city may hold a place_id; prefer name meta and billing fallback.
      *
      * @param WC_Order $order Order.
      * @return string
@@ -3333,7 +3779,7 @@ class OC_StoreOS_Integration {
     }
 
     /**
-     * Line item "baker" / product note for outgoing StoreOS payload.
+     * Line item "baker" / product note for outgoing Giorgio payload.
      * Theme saves cart `product_note` as order item meta with label {@see __('הערות לקצב', 'woocommerce')},
      * so the stored meta key is the translated string (not literal `product_note`).
      *
@@ -3371,7 +3817,7 @@ class OC_StoreOS_Integration {
     }
 
     /**
-     * Whether this line is considered "on promotion" for StoreOS: paid less than pre-discount line and/or below product regular price.
+     * Whether this line is considered "on promotion" for Giorgio: paid less than pre-discount line and/or below product regular price.
      *
      * @param WC_Order_Item_Product $item Order line item.
      * @return bool
@@ -3566,7 +4012,7 @@ class OC_StoreOS_Integration {
             $product_note = $this->get_order_line_item_product_note_for_storeos( $item );
 
 // 3. בניית ה-Payload
-            // StoreOS מצפה ל-Dictionary (JSON object); מערך PHP ריק נהפך ל-[] וגורם ל-400 ב-.NET.
+            // Giorgio מצפה ל-Dictionary (JSON object); מערך PHP ריק נהפך ל-[] וגורם ל-400 ב-.NET.
             $variation_attrs_for_json = empty( $variation_attributes )
                 ? new \stdClass()
                 : $variation_attributes;
@@ -3620,12 +4066,6 @@ class OC_StoreOS_Integration {
             default:
                 $external_status = 'on-hold';
                 break;
-        }
-
-        $user_note=$order->get_customer_note();
-
-        if(!$user_note){
-            $user_note= $order->get_meta('_billing_notes');
         }
 
         $payload = array(
@@ -3717,7 +4157,7 @@ class OC_StoreOS_Integration {
     }
 
     /**
-     * Cardcom fields for outgoing Order payload (first sync to StoreOS).
+     * Cardcom fields for outgoing Order payload (first sync to Giorgio).
      *
      * @param WC_Order $order Order.
      * @return array Keys: internalNumber, exp_mo, exp_year, numOfPayments, cc_number (only when meta is non-empty).
@@ -3790,7 +4230,7 @@ class OC_StoreOS_Integration {
     }
 
     /**
-     * Normalize a delivery/pickup date string for StoreOS API (YYYY-MM-DD).
+     * Normalize a delivery/pickup date string for Giorgio API (YYYY-MM-DD).
      * OC Woo Shipping stores display dates as d/m/Y and sortable as Y/m/d.
      *
      * @param string $date Raw date from order meta or OCWS.
@@ -3885,7 +4325,7 @@ class OC_StoreOS_Integration {
     }
 
     /**
-     * Extract normalized shipping info from OC StoreOS meta on the order.
+     * Extract normalized shipping info from OC Giorgio meta on the order.
      *
      * @param WC_Order $order Order object.
      * @return array
@@ -4148,7 +4588,7 @@ class OC_StoreOS_Integration {
     protected function send_order_to_api( $order, $payload, $options ) {
         $endpoint = trailingslashit( $options['api_base_url'] ) . 'WooCommerce/Order';
 
-        error_log( sprintf( '[OC StoreOS] Outgoing Order: send_order_to_api start. order_id=%d endpoint=%s', (int) $order->get_id(), $endpoint ) );
+        $this->maybe_debug_log( sprintf( '[OC Giorgio] Outgoing Order: send_order_to_api start. order_id=%d endpoint=%s', (int) $order->get_id(), $endpoint ) );
 
         // Log outgoing payload (trimmed) for debugging.
         $payload_json_for_log = wp_json_encode( $payload );
@@ -4169,14 +4609,25 @@ class OC_StoreOS_Integration {
             )
         );
 
-        // Debug: email outgoing payload (no API secrets are included in payload).
-        if ( function_exists( 'wp_mail' ) ) {
-            $subject = sprintf( 'StoreOS Outgoing Order Payload (order_id=%d)', (int) $order->get_id() );
-            $headers = array( 'Content-Type: text/plain; charset=UTF-8' );
-            // Keep mail size reasonable as well.
-            $mail_ok = wp_mail( 'omer@originalconcepts.co.il', $subject, substr( (string) $payload_json_for_log, 0, 20000 ), $headers );
-            error_log( sprintf( '[OC StoreOS] Outgoing Order: wp_mail sent=%s', $mail_ok ? 'yes' : 'no' ) );
-        }
+        // Full outgoing payload to the dedicated outgoing log (mirrors the incoming payload log).
+        $this->log_rest_outgoing_order(
+            array(
+                'time_utc' => gmdate( 'c' ),
+                'result'   => 'outgoing_payload',
+                'endpoint' => $endpoint,
+                'order_id' => (int) $order->get_id(),
+                'payload'  => $payload,
+            )
+        );
+
+        // Optional debug copy of the outgoing payload by email (OFF by default). This is the first of
+        // two emails per credit order: AUTHORIZATION (J5 hold, sent here) and CAPTURE (the OrderPayment
+        // call, sent from send_order_payment_webhook_v2_request).
+        $this->send_outgoing_debug_email(
+            sprintf( 'Giorgio — AUTHORIZATION (order %d)', (int) $order->get_id() ),
+            "=== STAGE: AUTHORIZATION (J5 hold) — POST /WooCommerce/Order ===\n\n"
+                . "PAYLOAD SENT:\n" . (string) $payload_json_for_log
+        );
 
         $args = array(
             'method'      => 'POST',
@@ -4191,10 +4642,10 @@ class OC_StoreOS_Integration {
             'data_format' => 'body',
         );
 
-        error_log( sprintf( '[OC StoreOS] Outgoing Order: wp_remote_post start. order_id=%d', (int) $order->get_id() ) );
+        $this->maybe_debug_log( sprintf( '[OC Giorgio] Outgoing Order: wp_remote_post start. order_id=%d', (int) $order->get_id() ) );
         $response = wp_remote_post( $endpoint, $args );
         if ( is_wp_error( $response ) ) {
-            error_log( sprintf( '[OC StoreOS] Outgoing Order: wp_remote_post WP_Error. order_id=%d err=%s', (int) $order->get_id(), $response->get_error_message() ) );
+            $this->maybe_debug_log( sprintf( '[OC Giorgio] Outgoing Order: wp_remote_post WP_Error. order_id=%d err=%s', (int) $order->get_id(), $response->get_error_message() ) );
             $this->log_order_error( $order->get_id(), $response->get_error_message() );
             return array(
                 'success'     => false,
@@ -4206,20 +4657,30 @@ class OC_StoreOS_Integration {
 
         $code     = (int) wp_remote_retrieve_response_code( $response );
         $body_raw = wp_remote_retrieve_body( $response );
-        error_log( sprintf( '[OC StoreOS] Outgoing Order: wp_remote_post response. order_id=%d http=%d body_prefix=%s', (int) $order->get_id(), (int) $code, substr( (string) $body_raw, 0, 250 ) ) );
+        $this->maybe_debug_log( sprintf( '[OC Giorgio] Outgoing Order: wp_remote_post response. order_id=%d http=%d body_prefix=%s', (int) $order->get_id(), (int) $code, substr( (string) $body_raw, 0, 250 ) ) );
         $decoded  = json_decode( $body_raw, true );
         $body     = ( JSON_ERROR_NONE === json_last_error() && null !== $decoded ) ? $decoded : $body_raw;
+
+        $this->log_rest_outgoing_order(
+            array(
+                'time_utc'  => gmdate( 'c' ),
+                'result'    => 'outgoing_response',
+                'order_id'  => (int) $order->get_id(),
+                'http'      => (int) $code,
+                'response'  => is_array( $decoded ) ? $decoded : substr( (string) $body_raw, 0, 4000 ),
+            )
+        );
 
         $http_ok = ( $code >= 200 && $code < 300 );
         $success = $http_ok;
 
-        // Prefer StoreOS logical success when the API returns it (common response shape: { isSuccessful, data: { id } }).
+        // Prefer Giorgio logical success when the API returns it (common response shape: { isSuccessful, data: { id } }).
         if ( $http_ok && is_array( $decoded ) ) {
             if ( array_key_exists( 'isSuccessful', $decoded ) ) {
                 $success = ( true === $decoded['isSuccessful'] );
             }
 
-            // If StoreOS returned a data.id, treat missing/invalid id as not-synced.
+            // If Giorgio returned a data.id, treat missing/invalid id as not-synced.
             if ( $success && isset( $decoded['data'] ) && is_array( $decoded['data'] ) ) {
                 if ( array_key_exists( 'id', $decoded['data'] ) ) {
                     $success = ( is_numeric( $decoded['data']['id'] ) && (int) $decoded['data']['id'] > 0 );
@@ -4289,11 +4750,53 @@ class OC_StoreOS_Integration {
             array( 'source' => self::WC_LOG_SOURCE ),
             $context
         );
-        $logger->log( $level, '[OC StoreOS] ' . $message, $ctx );
+        $logger->log( $level, '[OC Giorgio] ' . $message, $ctx );
     }
 
     /**
-     * WooCommerce: after payment is completed — send OrderPayment webhook (v2) to StoreOS.
+     * Verbose debug line to the PHP error log — only when debugging is on.
+     * Enabled by the `debug_logging` option, by WP_DEBUG, or via the
+     * `oc_storeos_debug_logging` filter. Keeps production logs quiet by default.
+     *
+     * @param string $message Message to log.
+     */
+    protected function maybe_debug_log( $message ) {
+        $options = $this->get_options();
+        $on      = ! empty( $options['debug_logging'] )
+            || ( defined( 'WP_DEBUG' ) && WP_DEBUG );
+        $on      = (bool) apply_filters( 'oc_storeos_debug_logging', $on );
+        if ( ! $on ) {
+            return;
+        }
+        \error_log( (string) $message );
+    }
+
+    /**
+     * Send a debug copy of an outgoing payload/response by email, if enabled.
+     * OFF by default (option `debug_outgoing_email`); recipient is configurable and defaults to the
+     * site admin email — never hardcoded. Body is plain text and size-capped.
+     *
+     * @param string $subject Email subject.
+     * @param string $body    Plain-text body (payload and/or response).
+     */
+    protected function send_outgoing_debug_email( $subject, $body ) {
+        $opts = $this->get_options();
+        if ( empty( $opts['debug_outgoing_email'] ) || ! function_exists( 'wp_mail' ) ) {
+            return;
+        }
+        $recipient = ( ! empty( $opts['debug_email_recipient'] ) && is_email( $opts['debug_email_recipient'] ) )
+            ? (string) $opts['debug_email_recipient']
+            : (string) get_option( 'admin_email' );
+        if ( '' === $recipient || ! is_email( $recipient ) ) {
+            return;
+        }
+        $headers = array( 'Content-Type: text/plain; charset=UTF-8' );
+        $ok      = wp_mail( $recipient, (string) $subject, substr( (string) $body, 0, 40000 ), $headers );
+        $this->maybe_debug_log( sprintf( '[OC Giorgio] debug email "%s" sent=%s', (string) $subject, $ok ? 'yes' : 'no' ) );
+    }
+
+    /**
+     * WooCommerce: after payment is completed — send OrderPayment webhook (v2) to Giorgio.
      *
      * @param int $order_id Order ID.
      */
@@ -4319,7 +4822,7 @@ class OC_StoreOS_Integration {
     }
 
     /**
-     * WooCommerce: when order becomes completed — send OrderPayment webhook (v2) to StoreOS.
+     * WooCommerce: when order becomes completed — send OrderPayment webhook (v2) to Giorgio.
      *
      * @param int        $order_id   Order ID.
      * @param string     $old_status Previous status.
@@ -4447,7 +4950,7 @@ class OC_StoreOS_Integration {
     }
 
     /**
-     * Cardcom payment profile for StoreOS OrderPayment (gateway id and/or Cardcom deal meta on the order).
+     * Cardcom payment profile for Giorgio OrderPayment (gateway id and/or Cardcom deal meta on the order).
      *
      * @param WC_Order $order Order.
      * @return string 'cardcom'|'unknown'
@@ -4504,8 +5007,6 @@ class OC_StoreOS_Integration {
      * @return array
      */
     protected function build_order_payment_webhook_v2_payload( WC_Order $order ) {
-//        var_dump($order);
-//        die;
         $profile         = $this->resolve_storeos_payment_gateway_profile( $order );
         $options         = $this->get_options();
         $payment_gateway = $this->resolve_payment_label_for_payload( $order, $options );
@@ -4542,7 +5043,7 @@ class OC_StoreOS_Integration {
                 $payload['payment'] = $payment_block;
                 $payload['gatewayPaymentStatus'] = 'authorized';
                 $payload['gatewayIsFinished']    = 'false';
-                // StoreOS: mark final charge (likiut) as finished outside the payment object.
+                // Giorgio: mark final charge (likiut) as finished outside the payment object.
                 $payload['isFinished'] = ( 'completed' === (string) $order->get_status() ) ? 'true' : 'false';
             }
 
@@ -4562,7 +5063,7 @@ class OC_StoreOS_Integration {
     } 
 
     /**
-     * POST payment webhook v2 to StoreOS (does not use order sync meta / notes).
+     * POST payment webhook v2 to Giorgio (does not use order sync meta / notes).
      *
      * @param WC_Order $order   Order.
      * @param array    $payload JSON body.
@@ -4591,13 +5092,24 @@ class OC_StoreOS_Integration {
             )
         );
 
+        // Full OrderPayment (capture-stage) payload to the dedicated outgoing log.
+        $this->log_rest_outgoing_order(
+            array(
+                'time_utc' => gmdate( 'c' ),
+                'result'   => 'outgoing_payment_payload',
+                'endpoint' => $endpoint,
+                'order_id' => $oid,
+                'payload'  => $payload,
+            )
+        );
+
         $args = array(
             'method'      => 'POST',
             'timeout'     => 20,
             'headers'     => array(
                 'Content-Type' => 'application/json',
                 'X-Api-Key'    => $options['api_token'],
-                // Some StoreOS endpoints require Bearer auth in addition to X-Api-Key.
+                // Some Giorgio endpoints require Bearer auth in addition to X-Api-Key.
             ),
             'body'        => $payload_json,
             'data_format' => 'body',
@@ -4611,9 +5123,9 @@ class OC_StoreOS_Integration {
         if ( isset( $headers_for_log['Authorization'] ) ) {
             $headers_for_log['Authorization'] = '***redacted***';
         }
-        error_log(
+        $this->maybe_debug_log(
             sprintf(
-                '[OC StoreOS] OrderPayment v2 request: order_id=%d endpoint=%s headers=%s body_prefix=%s',
+                '[OC Giorgio] OrderPayment v2 request: order_id=%d endpoint=%s headers=%s body_prefix=%s',
                 $oid,
                 $endpoint,
                 wp_json_encode( $headers_for_log ),
@@ -4624,11 +5136,17 @@ class OC_StoreOS_Integration {
         $response = wp_remote_post( $endpoint, $args );
 
         if ( is_wp_error( $response ) ) {
-            error_log( sprintf( '[OC StoreOS] OrderPayment v2 response: WP_Error. order_id=%d err=%s', $oid, $response->get_error_message() ) );
+            $this->maybe_debug_log( sprintf( '[OC Giorgio] OrderPayment v2 response: WP_Error. order_id=%d err=%s', $oid, $response->get_error_message() ) );
             $this->oc_storeos_wc_log(
                 'error',
                 sprintf( 'OrderPayment v2: HTTP transport error. order_id=%d err=%s', $oid, $response->get_error_message() ),
                 array( 'order_id' => $oid )
+            );
+            $this->send_outgoing_debug_email(
+                sprintf( 'Giorgio — CAPTURE (order %d) — TRANSPORT ERROR', $oid ),
+                "=== STAGE: CAPTURE — POST /WooCommerce/OrderPayment ===\n\n"
+                    . "PAYLOAD SENT:\n" . (string) $payload_json . "\n\n"
+                    . "TRANSPORT ERROR:\n" . $response->get_error_message()
             );
             $this->log_payment_webhook_v2_error( $order->get_id(), $response->get_error_message() );
             return;
@@ -4636,11 +5154,28 @@ class OC_StoreOS_Integration {
 
         $code = (int) wp_remote_retrieve_response_code( $response );
         $resp_body = wp_remote_retrieve_body( $response );
+        $resp_decoded = json_decode( (string) $resp_body, true );
+        $this->log_rest_outgoing_order(
+            array(
+                'time_utc' => gmdate( 'c' ),
+                'result'   => 'outgoing_payment_response',
+                'order_id' => $oid,
+                'http'     => $code,
+                'response' => is_array( $resp_decoded ) ? $resp_decoded : substr( (string) $resp_body, 0, 4000 ),
+            )
+        );
+        // Second of the two debug emails per credit order: CAPTURE (payload + Giorgio's response).
+        $this->send_outgoing_debug_email(
+            sprintf( 'Giorgio — CAPTURE (order %d) — HTTP %d', $oid, $code ),
+            "=== STAGE: CAPTURE — POST /WooCommerce/OrderPayment ===\n\n"
+                . "PAYLOAD SENT:\n" . (string) $payload_json . "\n\n"
+                . "GIORGIO RESPONSE (HTTP " . $code . "):\n" . (string) $resp_body
+        );
         $resp_headers = function_exists( 'wp_remote_retrieve_headers' ) ? wp_remote_retrieve_headers( $response ) : null;
         $resp_headers_arr = is_object( $resp_headers ) && method_exists( $resp_headers, 'getAll' ) ? $resp_headers->getAll() : ( is_array( $resp_headers ) ? $resp_headers : array() );
-        error_log(
+        $this->maybe_debug_log(
             sprintf(
-                '[OC StoreOS] OrderPayment v2 response: order_id=%d http=%d headers=%s body_prefix=%s',
+                '[OC Giorgio] OrderPayment v2 response: order_id=%d http=%d headers=%s body_prefix=%s',
                 $oid,
                 $code,
                 wp_json_encode( $resp_headers_arr ),
@@ -4662,7 +5197,7 @@ class OC_StoreOS_Integration {
                 $order_note->add_order_note(
                     sprintf(
                     /* translators: 1: HTTP status code, 2: payload status (e.g. success/failed). */
-                        __( 'StoreOS: עדכון תשלום (OrderPayment) נשלח חזרה למערכת והתקבל בהצלחה (HTTP %1$d, סטטוס בדיווח: %2$s).', 'oc-storeos-integration' ),                        $code,
+                        __( 'Giorgio: עדכון תשלום (OrderPayment) נשלח חזרה למערכת והתקבל בהצלחה (HTTP %1$d, סטטוס בדיווח: %2$s).', 'oc-storeos-integration' ),                        $code,
                         '' !== $reported ? $reported : '—'
                     ),
                     false,
@@ -4687,11 +5222,13 @@ class OC_StoreOS_Integration {
      * @param string $message  Error message.
      */
     protected function log_payment_webhook_v2_error( $order_id, $message ) {
-        update_post_meta( $order_id, '_oc_storeos_payment_webhook_v2_error', $message );
-        update_post_meta( $order_id, '_oc_storeos_payment_webhook_v2_at', current_time( 'mysql' ) );
+        $this->set_order_meta_safe( $order_id, array(
+            '_oc_storeos_payment_webhook_v2_error' => $message,
+            '_oc_storeos_payment_webhook_v2_at'    => current_time( 'mysql' ),
+        ) );
 
         if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
-            error_log( sprintf( 'OC StoreOS OrderPayment v2 webhook error (order %d): %s', $order_id, $message ) );
+            $this->maybe_debug_log( sprintf( 'OC Giorgio OrderPayment v2 webhook error (order %d): %s', $order_id, $message ) );
         }
     }
 
@@ -4699,8 +5236,31 @@ class OC_StoreOS_Integration {
      * @param int $order_id Order ID.
      */
     protected function mark_payment_webhook_v2_ok( $order_id ) {
-        update_post_meta( $order_id, '_oc_storeos_payment_webhook_v2_error', '' );
-        update_post_meta( $order_id, '_oc_storeos_payment_webhook_v2_at', current_time( 'mysql' ) );
+        $this->set_order_meta_safe( $order_id, array(
+            '_oc_storeos_payment_webhook_v2_error' => '',
+            '_oc_storeos_payment_webhook_v2_at'    => current_time( 'mysql' ),
+        ) );
+    }
+
+    /**
+     * HPOS-safe order meta write. Persists meta via the order object so it works under both legacy
+     * post storage and custom order tables. Uses save_meta_data() (not save()) so it does not re-fire
+     * order-save hooks — important to avoid recursion with the woocommerce_update_order trigger.
+     *
+     * @param int                  $order_id Order ID.
+     * @param array<string, mixed> $meta     key => value pairs.
+     * @return bool True when saved.
+     */
+    protected function set_order_meta_safe( $order_id, array $meta ) {
+        $order = wc_get_order( (int) $order_id );
+        if ( ! $order instanceof WC_Order ) {
+            return false;
+        }
+        foreach ( $meta as $key => $value ) {
+            $order->update_meta_data( (string) $key, $value );
+        }
+        $order->save_meta_data();
+        return true;
     }
 
     /**
@@ -4783,10 +5343,12 @@ class OC_StoreOS_Integration {
      * @param int $order_id Order ID.
      */
     protected function mark_order_synced( $order_id, $http_status = null, $response_body_raw = null ) {
-        update_post_meta( $order_id, self::META_SYNCED, 1 );
-        update_post_meta( $order_id, self::META_LAST_ERR, '' );
         $synced_at = current_time( 'mysql' );
-        update_post_meta( $order_id, self::META_LAST_SYNC, $synced_at );
+        $this->set_order_meta_safe( $order_id, array(
+            self::META_SYNCED    => 1,
+            self::META_LAST_ERR  => '',
+            self::META_LAST_SYNC => $synced_at,
+        ) );
 
         // Add an internal order note as a visible indicator in admin.
         $order = wc_get_order( $order_id );
@@ -4794,7 +5356,7 @@ class OC_StoreOS_Integration {
             $order->add_order_note(
                 sprintf(
                 /* translators: %s is a datetime in mysql format */
-                    __( 'ההזמנה סונכרנה ל‑StoreOS בהצלחה (%s).', 'oc-storeos-integration' ),
+                    __( 'ההזמנה סונכרנה ל‑Giorgio בהצלחה (%s).', 'oc-storeos-integration' ),
                     $synced_at
                 ),
                 false,
@@ -4814,7 +5376,7 @@ class OC_StoreOS_Integration {
 //                    $order->add_order_note(
 //                        sprintf(
 //                            /* translators: 1: HTTP status code, 2: response body (truncated). */
-//                            __( 'StoreOS response (HTTP %1$d): %2$s', 'oc-storeos-integration' ),
+//                            __( 'Giorgio response (HTTP %1$d): %2$s', 'oc-storeos-integration' ),
 //                            (int) $http_status,
 //                            $resp
 //                        ),
@@ -4833,56 +5395,17 @@ class OC_StoreOS_Integration {
      * @param string $message  Error message.
      */
     protected function log_order_error( $order_id, $message ) {
-        update_post_meta( $order_id, self::META_SYNCED, 0 );
-        update_post_meta( $order_id, self::META_LAST_ERR, $message );
-        update_post_meta( $order_id, self::META_LAST_SYNC, current_time( 'mysql' ) );
+        $this->set_order_meta_safe( $order_id, array(
+            self::META_SYNCED    => 0,
+            self::META_LAST_ERR  => $message,
+            self::META_LAST_SYNC => current_time( 'mysql' ),
+        ) );
 
         if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
-            error_log( sprintf( 'OC StoreOS Integration error for order %d: %s', $order_id, $message ) );
+            $this->maybe_debug_log( sprintf( 'OC Giorgio Integration error for order %d: %s', $order_id, $message ) );
         }
     }
 
-    /**
-     * Temporary debug: print shipping-related meta for order 1921.
-     */
-    public function debug_order_meta_1921() {
-        if ( ! is_admin() ) {
-            return;
-        }
-
-        if ( ! current_user_can( 'manage_woocommerce' ) ) {
-            return;
-        }
-
-        if ( ! isset( $_GET['debug_ocws_1921'] ) ) {
-            return;
-        }
-
-        $order = wc_get_order( 1921 );
-        if ( ! $order ) {
-            echo '<pre>Order 1921 not found.</pre>';
-            exit;
-        }
-
-        $meta_keys = array(
-            'ocws_shipping_info',
-            'ocws_shipping_info_date',
-            'ocws_shipping_info_date_sortable',
-            'ocws_shipping_info_slot_start',
-            'ocws_shipping_info_slot_end',
-            '_oc_storeos_delivery_date',
-            '_oc_storeos_delivery_slot_start',
-            '_oc_storeos_delivery_slot_end',
-        );
-
-        $data = array();
-        foreach ( $meta_keys as $key ) {
-            $data[ $key ] = $order->get_meta( $key, true );
-        }
-
-        echo '<pre>' . esc_html( print_r( $data, true ) ) . '</pre>';
-        exit;
-    }
 }
 
 /**

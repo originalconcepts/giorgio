@@ -1,11 +1,11 @@
 <?php
 /**
- * Plugin Name: OC StoreOS Integration
- * Description: Two-way order sync between WooCommerce and external OC StoreOS system.
-
-=======
- * Version: 1.2.9
- * Author: OC
+ * Plugin Name: OC Giorgio Integration
+ * Plugin URI: https://onlinestore.co.il
+ * Description: Two-way order sync between WooCommerce and the Giorgio platform.
+ * Version: 1.7.5
+ * Author: Original Concepts
+ * Author URI: https://onlinestore.co.il
  * Text Domain: oc-storeos-integration
  */
 
@@ -13,7 +13,7 @@ if ( ! defined( 'ABSPATH' ) ) {
     exit;
 }
 
-define( 'OC_STOREOS_INTEGRATION_VERSION', '1.2.9' );
+define( 'OC_STOREOS_INTEGRATION_VERSION', '1.7.3' );
 define( 'OC_STOREOS_INTEGRATION_PLUGIN_FILE', __FILE__ );
 define( 'OC_STOREOS_INTEGRATION_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
 
@@ -24,12 +24,12 @@ define( 'OC_STOREOS_INTEGRATION_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
  * published on GitHub. WordPress compares the latest GitHub release tag to the
  * installed plugin Version header and offers an update when newer.
  *
- * Repo: https://github.com/omerelias/oc-storeos-integration (public)
+ * Repo: https://github.com/originalconcepts/giorgio (set GITHUB_USER/GITHUB_REPO below to match the real repo)
  */
 class OC_StoreOS_Integration_Updater {
 
-	const GITHUB_USER = 'omerelias';
-	const GITHUB_REPO = 'oc-storeos-integration';
+	const GITHUB_USER = 'originalconcepts'; // TODO: set to the exact GitHub account/org the repo lives under
+	const GITHUB_REPO = 'giorgio';
 
 	const CACHE_KEY = 'oc_storeos_integration_gh_release';
 	const CACHE_TTL = 6 * HOUR_IN_SECONDS; // be nice to GitHub's rate limit
@@ -39,12 +39,12 @@ class OC_StoreOS_Integration_Updater {
 	 *
 	 * Example: 'my-plugin/my-plugin.php'
 	 */
-	const PLUGIN_BASENAME = 'oc-storeos-integration/oc-storeos-integration.php';
+	const PLUGIN_BASENAME = 'giorgio/giorgio.php';
 
 	/**
 	 * Folder name WordPress expects after extracting the zip.
 	 */
-	const PLUGIN_DIRNAME = 'oc-storeos-integration';
+	const PLUGIN_DIRNAME = 'giorgio';
 
 	public function __construct() {
 		add_filter( 'pre_set_site_transient_update_plugins', [ $this, 'check_for_update' ] );
@@ -52,6 +52,76 @@ class OC_StoreOS_Integration_Updater {
 		add_action( 'upgrader_process_complete', [ $this, 'flush_cache' ], 10, 2 );
 		add_action( 'admin_post_oc_storeos_integration_force_check', [ $this, 'handle_force_check' ] );
 		add_action( 'admin_notices', [ $this, 'render_check_button' ] );
+		add_filter( 'auto_update_plugin', [ $this, 'enable_auto_update' ], 10, 2 );
+		// Authenticate GitHub API + asset requests so updates work from a PRIVATE repo.
+		add_filter( 'http_request_args', [ $this, 'authorize_github_request' ], 10, 2 );
+	}
+
+	/**
+	 * Access token for a private GitHub repo. Read from (in order):
+	 *   1. constant OC_GIORGIO_GH_TOKEN (define in wp-config.php — most secure), or
+	 *   2. the plugin setting `github_token`.
+	 * Empty string = public repo (no auth). A fine-grained, read-only "Contents" token
+	 * scoped to just this repo is recommended.
+	 *
+	 * @return string
+	 */
+	private function get_token() {
+		if ( defined( 'OC_GIORGIO_GH_TOKEN' ) && OC_GIORGIO_GH_TOKEN ) {
+			return (string) OC_GIORGIO_GH_TOKEN;
+		}
+		$opts = get_option( 'oc_storeos_integration_options', [] );
+		return ( is_array( $opts ) && ! empty( $opts['github_token'] ) ) ? (string) $opts['github_token'] : '';
+	}
+
+	/**
+	 * Add the Authorization header to requests aimed at THIS repo's GitHub API, so a private
+	 * repo's release info and asset/zipball can be fetched. For the binary download endpoints
+	 * (asset / zipball / tarball) we also ask for raw bytes.
+	 *
+	 * @param array  $args HTTP args.
+	 * @param string $url  Request URL.
+	 * @return array
+	 */
+	public function authorize_github_request( $args, $url ) {
+		$token = $this->get_token();
+		if ( '' === $token ) {
+			return $args;
+		}
+		$base = 'https://api.github.com/repos/' . self::GITHUB_USER . '/' . self::GITHUB_REPO;
+		if ( strpos( (string) $url, $base ) !== 0 ) {
+			return $args;
+		}
+		if ( empty( $args['headers'] ) || ! is_array( $args['headers'] ) ) {
+			$args['headers'] = [];
+		}
+		$args['headers']['Authorization'] = 'Bearer ' . $token;
+		if ( empty( $args['headers']['User-Agent'] ) ) {
+			$args['headers']['User-Agent'] = 'WordPress/' . get_bloginfo( 'version' ) . '; ' . home_url();
+		}
+		// Binary endpoints: request the raw archive, not JSON metadata.
+		if ( false !== strpos( $url, '/releases/assets/' )
+			|| false !== strpos( $url, '/zipball' )
+			|| false !== strpos( $url, '/tarball' ) ) {
+			$args['headers']['Accept'] = 'application/octet-stream';
+		}
+		return $args;
+	}
+
+	/**
+	 * Enable WordPress background auto-updates for this plugin by default, so a new GitHub release
+	 * is installed automatically without anyone clicking "update". A site can opt out via the
+	 * `oc_giorgio_enable_auto_update` filter (return false).
+	 *
+	 * @param bool|null $update Whether to auto-update.
+	 * @param object    $item   The update offer object.
+	 * @return bool|null
+	 */
+	public function enable_auto_update( $update, $item ) {
+		if ( is_object( $item ) && ! empty( $item->plugin ) && self::PLUGIN_BASENAME === $item->plugin ) {
+			return (bool) apply_filters( 'oc_giorgio_enable_auto_update', true );
+		}
+		return $update;
 	}
 
 	/**
@@ -73,7 +143,7 @@ class OC_StoreOS_Integration_Updater {
 		if ( version_compare( $remote_ver, $installed_ver, '>' ) ) {
 			// Plugin updates expect an object (stdClass). WP later reads `$update->package`.
 			$transient->response[ self::PLUGIN_BASENAME ] = (object) [
-				'slug'        => self::GITHUB_REPO,
+				'slug'        => self::PLUGIN_DIRNAME,
 				'plugin'      => self::PLUGIN_BASENAME,
 				'new_version' => $remote_ver,
 				'url'         => 'https://github.com/' . self::GITHUB_USER . '/' . self::GITHUB_REPO,
@@ -81,7 +151,7 @@ class OC_StoreOS_Integration_Updater {
 			];
 		} else {
 			$transient->no_update[ self::PLUGIN_BASENAME ] = (object) [
-				'slug'        => self::GITHUB_REPO,
+				'slug'        => self::PLUGIN_DIRNAME,
 				'plugin'      => self::PLUGIN_BASENAME,
 				'new_version' => $remote_ver,
 				'url'         => 'https://github.com/' . self::GITHUB_USER . '/' . self::GITHUB_REPO,
@@ -152,13 +222,18 @@ class OC_StoreOS_Integration_Updater {
 
 		// Prefer an uploaded .zip asset (clean build) if one exists.
 		// Otherwise fall back to GitHub's auto-generated source zipball.
+		// For a PRIVATE repo we must download via the API URL (asset['url'] / zipball_url) so the
+		// Authorization header is honoured; the public browser_download_url won't authenticate.
+		$has_token = ( '' !== $this->get_token() );
 		$zip = $body['zipball_url'];
 		if ( ! empty( $body['assets'] ) && is_array( $body['assets'] ) ) {
 			foreach ( $body['assets'] as $asset ) {
-				if ( ! empty( $asset['browser_download_url'] )
-					&& ! empty( $asset['name'] )
-					&& substr( $asset['name'], -4 ) === '.zip' ) {
-					$zip = $asset['browser_download_url'];
+				if ( ! empty( $asset['name'] ) && substr( $asset['name'], -4 ) === '.zip' ) {
+					if ( $has_token && ! empty( $asset['url'] ) ) {
+						$zip = $asset['url']; // api.github.com/.../releases/assets/{id}
+					} elseif ( ! empty( $asset['browser_download_url'] ) ) {
+						$zip = $asset['browser_download_url'];
+					}
 					break;
 				}
 			}
@@ -211,7 +286,7 @@ class OC_StoreOS_Integration_Updater {
 	}
 
 	/**
-	 * GitHub zips extract to something like `omerelias-oc-storeos-integration-abc1234/`.
+	 * GitHub zips extract to something like `originalconcepts-giorgio-abc1234/`.
 	 * WordPress expects the folder to be `oc-storeos-integration/`, otherwise it treats
 	 * the upgrade as a brand-new plugin and the site may lose activation state.
 	 */
@@ -273,7 +348,7 @@ class OC_StoreOS_Integration_Updater {
 	}
 
 	/**
-	 * Show a notice with a "Check OC StoreOS Integration updates now" button on the
+	 * Show a notice with a "Check OC Giorgio Integration updates now" button on the
 	 * updates screen only. Also shows installed vs. latest-seen versions.
 	 */
 	public function render_check_button() {
@@ -300,7 +375,7 @@ class OC_StoreOS_Integration_Updater {
 		$just_checked = ! empty( $_GET['oc_storeos_integration_checked'] ); // phpcs:ignore WordPress.Security.NonceVerification.Recommended
 		?>
 		<div class="notice notice-info" style="padding:14px 18px;">
-			<h3 style="margin:0 0 6px;">תוסף OC StoreOS Integration - בדיקת עדכונים מ-GitHub</h3>
+			<h3 style="margin:0 0 6px;">תוסף OC Giorgio Integration - בדיקת עדכונים מ-GitHub</h3>
 			<p style="margin:4px 0;">
 				<strong>גרסה מותקנת:</strong> <?php echo esc_html( $installed_ver ); ?>
 				&nbsp;|&nbsp;
@@ -321,14 +396,29 @@ class OC_StoreOS_Integration_Updater {
 
 new OC_StoreOS_Integration_Updater();
 
-require_once OC_STOREOS_INTEGRATION_PLUGIN_DIR . 'includes/class-oc-storeos-integration.php';
+require_once OC_STOREOS_INTEGRATION_PLUGIN_DIR . 'includes/class-giorgio-integration.php';
+require_once OC_STOREOS_INTEGRATION_PLUGIN_DIR . 'includes/class-giorgio-ed-product-rest.php';
+
+// Declare compatibility with WooCommerce High-Performance Order Storage (custom order tables).
+add_action(
+    'before_woocommerce_init',
+    static function () {
+        if ( class_exists( '\Automattic\WooCommerce\Utilities\FeaturesUtil' ) ) {
+            \Automattic\WooCommerce\Utilities\FeaturesUtil::declare_compatibility(
+                'custom_order_tables',
+                OC_STOREOS_INTEGRATION_PLUGIN_FILE,
+                true
+            );
+        }
+    }
+);
 
 add_action(
     'plugins_loaded',
     static function () {
         if ( class_exists( 'WooCommerce' ) ) {
-            OC_StoreOS_Integration::get_instance();
+            $integration = OC_StoreOS_Integration::get_instance();
+            new OC_Giorgio_ED_Product_REST( $integration );
         }
     }
 );
-
