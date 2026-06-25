@@ -964,6 +964,79 @@ class OC_StoreOS_Integration {
     }
 
     /**
+     * הוספת שורת פריט מותאמת (ללא מוצר קטלוגי) מתוך payload — עבור "מוצר כללי" שנוסף בליקוט
+     * ואין לו SKU/productId בקטלוג ה-WooCommerce. בלי זה השורה נשמטת בשקט וההזמנה באתר חסרה אותה.
+     * מטפל במע"מ באותה דרך כמו add_storeos_rest_order_line_from_payload (filter oc_storeos_rest_item_line_amount_includes_tax).
+     *
+     * @param WC_Order $order        ההזמנה.
+     * @param float    $quantity     כמות (>0).
+     * @param array    $payload_item שורת ה-payload (name + lineTotal/unitPrice).
+     * @return bool true אם נוספה שורה.
+     */
+    protected function add_storeos_rest_custom_order_line_from_payload( WC_Order $order, $quantity, array $payload_item ) {
+        if ( ! $order instanceof WC_Order || $quantity <= 0 ) {
+            return false;
+        }
+
+        $name = isset( $payload_item['name'] ) ? sanitize_text_field( (string) $payload_item['name'] ) : '';
+        if ( '' === $name ) {
+            return false; // ללא שם אין מה להציג — לא נוסיף שורה אנונימית.
+        }
+
+        $raw = null;
+        if ( isset( $payload_item['lineTotal'] ) && is_numeric( $payload_item['lineTotal'] ) ) {
+            $raw = (float) $payload_item['lineTotal'];
+        } elseif ( isset( $payload_item['line_total'] ) && is_numeric( $payload_item['line_total'] ) ) {
+            $raw = (float) $payload_item['line_total'];
+        } elseif ( isset( $payload_item['unitPrice'] ) && is_numeric( $payload_item['unitPrice'] ) ) {
+            $raw = (float) $payload_item['unitPrice'] * (float) $quantity;
+        } elseif ( isset( $payload_item['unit_price'] ) && is_numeric( $payload_item['unit_price'] ) ) {
+            $raw = (float) $payload_item['unit_price'] * (float) $quantity;
+        }
+
+        if ( null === $raw || $raw < 0 ) {
+            return false; // ללא סכום אי אפשר לחשב שורת חיוב.
+        }
+
+        $decimals = wc_get_price_decimals();
+        $amount   = wc_format_decimal( $raw, $decimals );
+
+        $includes_tax = (bool) apply_filters(
+            'oc_storeos_rest_item_line_amount_includes_tax',
+            false,
+            $payload_item,
+            null,
+            $order
+        );
+
+        $net_line = $amount;
+        if ( $includes_tax && wc_tax_enabled() && class_exists( 'WC_Tax' ) ) {
+            $rates_kw = array(
+                'country'   => $order->get_shipping_country() ? $order->get_shipping_country() : $order->get_billing_country(),
+                'state'     => $order->get_shipping_state() ? $order->get_shipping_state() : $order->get_billing_state(),
+                'postcode'  => $order->get_shipping_postcode() ? $order->get_shipping_postcode() : $order->get_billing_postcode(),
+                'city'      => $order->get_shipping_city() ? $order->get_shipping_city() : $order->get_billing_city(),
+                'tax_class' => '',
+            );
+            $tax_rates = WC_Tax::find_rates( $rates_kw );
+            if ( ! empty( $tax_rates ) ) {
+                $tax_parts = WC_Tax::calc_tax( $amount, $tax_rates, true );
+                $net_line  = wc_format_decimal( $amount - array_sum( $tax_parts ), $decimals );
+            }
+        }
+
+        $line = new WC_Order_Item_Product();
+        $line->set_name( $name );
+        $line->set_quantity( $quantity );
+        $line->set_subtotal( $net_line );
+        $line->set_total( $net_line );
+        $line->update_meta_data( '_oc_storeos_custom_line', 1 );
+        $order->add_item( $line );
+
+        return true;
+    }
+
+    /**
      * לפני חיוב טוקן Cardcom (priority 10): מאלץ calculate_totals + save כדי ש־initTerminal עם wc_get_order יראה סכום מעודכן.
      *
      * @param int               $order_id Order ID.
@@ -1232,7 +1305,18 @@ class OC_StoreOS_Integration {
                             ++$items_added;
                         }
                     } else {
-                        $items_unresolved_keys[] = $identifier;
+                        // No catalog product resolved. The line was picked + sent, so keep it in the order as a
+                        // custom line (name + amount) instead of dropping it — applies to a "general product"
+                        // (no sku/productId) AND to a catalog item whose sku/productId failed to resolve.
+                        if ( $this->add_storeos_rest_custom_order_line_from_payload( $order, $quantity, $item ) ) {
+                            ++$items_added;
+                        }
+                        // If a sku/productId WAS sent but didn't resolve, still flag it as unresolved so a real
+                        // catalog/SKU mismatch is surfaced in the sync note/log (the line was kept above; the
+                        // warning is informational and does not fail the totals reconciliation).
+                        if ( '' !== $identifier ) {
+                            $items_unresolved_keys[] = $identifier;
+                        }
                     }
                 }
             }
@@ -1301,6 +1385,10 @@ class OC_StoreOS_Integration {
             if ( ! empty( $data['externalOrderId'] ) ) {
                 $order->update_meta_data( '_oc_storeos_external_order_id', sanitize_text_field( (string) $data['externalOrderId'] ) );
             }
+
+            // המבצעים שהוחלו סופית בצד Giorgio (אחרי ליקוט) — נשמרים על ההזמנה לתצוגה/חשבונית/audit.
+            // Giorgio הוא מקור האמת למבצעים בהזמנה מנוהלת; לא מריצים כאן את מנוע המבצעים מחדש.
+            $this->apply_applied_promotions_from_storeos_payload( $order, $data );
 
             // שיטת תשלום מ־Giorgio (חובה לפלאקארד/קארדקום לפני מעבר ל־completed): paymentMethod | paymentMethodId | wcPaymentMethod
             $this->apply_payment_method_from_storeos_payload( $order, $data );
@@ -1488,6 +1576,40 @@ class OC_StoreOS_Integration {
                 )
             );
             return new WP_Error( 'oc_storeos_order_error', $e->getMessage(), array( 'status' => 500 ) );
+        }
+    }
+
+    /**
+     * שמירת המבצעים שהוחלו סופית בצד Giorgio (אחרי ליקוט) על ההזמנה — לתצוגה/חשבונית/audit.
+     * לא מריצים את מנוע המבצעים מחדש: Giorgio הוא מקור האמת בהזמנה מנוהלת. אם יש מבצעים, מסמנים
+     * את ההזמנה כך שרשם השימוש של promotion-engine לא ידווח אותה שוב (מניעת ספירה כפולה הפוכה).
+     * נכתב בכל סנכרון (idempotent — דורס, בלי note spam). מערך ריק מנקה סט קודם.
+     *
+     * @param WC_Order $order
+     * @param array    $data
+     */
+    protected function apply_applied_promotions_from_storeos_payload( WC_Order $order, array $data ) {
+        if ( ! isset( $data['appliedPromotions'] ) || ! is_array( $data['appliedPromotions'] ) ) {
+            return;
+        }
+
+        $clean = array();
+        foreach ( $data['appliedPromotions'] as $promo ) {
+            if ( ! is_array( $promo ) ) {
+                continue;
+            }
+            $clean[] = array(
+                'externalId'     => isset( $promo['externalId'] ) ? sanitize_text_field( (string) $promo['externalId'] ) : null,
+                'name'           => isset( $promo['name'] ) ? sanitize_text_field( (string) $promo['name'] ) : '',
+                'type'           => isset( $promo['type'] ) ? sanitize_text_field( (string) $promo['type'] ) : null,
+                'discountAmount' => isset( $promo['discountAmount'] ) ? (float) $promo['discountAmount'] : 0.0,
+            );
+        }
+
+        $order->update_meta_data( '_oc_storeos_applied_promotions', $clean );
+
+        if ( ! empty( $clean ) ) {
+            $order->update_meta_data( '_promeng_usage_recorded', 1 );
         }
     }
 
@@ -3869,6 +3991,39 @@ class OC_StoreOS_Integration {
     }
 
     /**
+     * Promotions actually applied on the order, read from the Promotion Engine's `_promeng_applied`
+     * order meta (written at checkout by PromoEngine\Cart::store_applied_on_order). Mapped to the
+     * Giorgio appliedPromotions shape. external_id is `george-{id}` for Giorgio-sourced promotions,
+     * null for promotions authored locally in WooCommerce. Order-level only (no per-line breakdown yet).
+     *
+     * @param WC_Order $order Order object.
+     * @return array
+     */
+    protected function build_applied_promotions_for_payload( $order ) {
+        $out     = array();
+        $applied = $order->get_meta( '_promeng_applied' );
+        if ( ! is_array( $applied ) ) {
+            return $out;
+        }
+        foreach ( $applied as $promotion_id => $info ) {
+            if ( ! is_array( $info ) ) {
+                continue;
+            }
+            $external_id = isset( $info['external_id'] ) ? (string) $info['external_id'] : '';
+            $coupon_code = isset( $info['coupon_code'] ) ? (string) $info['coupon_code'] : '';
+            $out[] = array(
+                'externalId'     => '' !== $external_id ? $external_id : null,
+                'wooPromotionId' => (int) $promotion_id,
+                'name'           => isset( $info['name'] ) ? (string) $info['name'] : '',
+                'type'           => isset( $info['type'] ) ? (string) $info['type'] : null,
+                'couponCode'     => '' !== $coupon_code ? $coupon_code : null,
+                'discountAmount' => isset( $info['saved'] ) ? (float) $info['saved'] : 0.0,
+            );
+        }
+        return $out;
+    }
+
+    /**
      * Build order payload as JSON-ready array.
      *
      * @param WC_Order $order   Order object.
@@ -4092,6 +4247,10 @@ class OC_StoreOS_Integration {
             'shippingTotal'   => (float) $order->get_shipping_total(),
             'orderTotal'      => (float) $order->get_total(),
             'customerNotes'   => $order->get_meta('_billing_notes'),
+            // Promotions actually applied by the Promotion Engine on this order, so Giorgio records the
+            // real promotion (not a re-evaluation) and avoids the /redemptions double-count. Always present
+            // ([] = no promotions) so the consumer can tell "none" from "not sent".
+            'appliedPromotions' => $this->build_applied_promotions_for_payload( $order ),
         );
 
         $shipping_label = $this->resolve_shipping_label_for_payload( $order, $options );
