@@ -1291,8 +1291,11 @@ class OC_StoreOS_Integration {
                     }
                     ++$items_eligible;
 
-                    $product = is_numeric( $identifier ) ? wc_get_product( (int) $identifier ) : null;
-                    if ( ! $product && function_exists( 'wc_get_product_id_by_sku' ) ) {
+                    // Guard against productId "0"/empty: wc_get_product( 0 ) resolves to the global/current
+                    // product, which would attach a wrong product's name + image to a "general product" line.
+                    // Require a positive numeric id (and a non-empty SKU) before resolving. Bug #9.
+                    $product = ( is_numeric( $identifier ) && (int) $identifier > 0 ) ? wc_get_product( (int) $identifier ) : null;
+                    if ( ! $product && '' !== $identifier && function_exists( 'wc_get_product_id_by_sku' ) ) {
                         $pid = wc_get_product_id_by_sku( $identifier );
                         if ( $pid ) {
                             $product = wc_get_product( $pid );

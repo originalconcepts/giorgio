@@ -3,7 +3,7 @@
  * Plugin Name: OC Giorgio Integration
  * Plugin URI: https://onlinestore.co.il
  * Description: Two-way order sync between WooCommerce and the Giorgio platform.
- * Version: 1.7.5
+ * Version: 1.7.6
  * Author: Original Concepts
  * Author URI: https://onlinestore.co.il
  * Text Domain: oc-storeos-integration
@@ -13,7 +13,7 @@ if ( ! defined( 'ABSPATH' ) ) {
     exit;
 }
 
-define( 'OC_STOREOS_INTEGRATION_VERSION', '1.7.3' );
+define( 'OC_STOREOS_INTEGRATION_VERSION', '1.7.6' );
 define( 'OC_STOREOS_INTEGRATION_PLUGIN_FILE', __FILE__ );
 define( 'OC_STOREOS_INTEGRATION_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
 
