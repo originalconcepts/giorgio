@@ -3996,8 +3996,16 @@ class OC_StoreOS_Integration {
     /**
      * Promotions actually applied on the order, read from the Promotion Engine's `_promeng_applied`
      * order meta (written at checkout by PromoEngine\Cart::store_applied_on_order). Mapped to the
-     * Giorgio appliedPromotions shape. external_id is `george-{id}` for Giorgio-sourced promotions,
-     * null for promotions authored locally in WooCommerce. Order-level only (no per-line breakdown yet).
+     * Giorgio appliedPromotions shape (spec §1.2). external_id is `george-{id}` for Giorgio-sourced
+     * promotions, null for promotions authored locally in WooCommerce.
+     *
+     * Per-line breakdown (`lines[]`): derived from what WooCommerce actually charged — each order line's
+     * `subtotal` (pre-discount) minus `total` (charged). This is the source of truth for George's per-line
+     * stamping. Because the Promotion Engine aggregates line discounts across promotions (it does not tag
+     * each discounted line with the owning promotion), we only attach `lines[]` when a single promotion is
+     * applied; for multiple promotions we send the order-level `discountAmount` only and let George
+     * distribute it (which it does as a fallback). The order-level `discountAmount` stays the engine's
+     * reported `saved` so existing behaviour is unchanged.
      *
      * @param WC_Order $order Order object.
      * @return array
@@ -4008,20 +4016,47 @@ class OC_StoreOS_Integration {
         if ( ! is_array( $applied ) ) {
             return $out;
         }
+
+        // Per-line discounts WooCommerce actually applied on this order (spec §1.2 lines[]).
+        $order_line_discounts = array();
+        foreach ( $order->get_items() as $item ) {
+            if ( ! $item instanceof WC_Order_Item_Product ) {
+                continue;
+            }
+            $discount = round( (float) $item->get_subtotal() - (float) $item->get_total(), 2 );
+            if ( $discount <= 0.0 ) {
+                continue;
+            }
+            $product = $item->get_product();
+            $order_line_discounts[] = array(
+                'productId'        => (int) $item->get_product_id(), // parent product id — matches George WooCommerceProductId
+                'sku'              => $product instanceof WC_Product ? (string) $product->get_sku() : '',
+                'quantityAffected' => (float) $item->get_quantity(),
+                'discountAmount'   => $discount,
+            );
+        }
+        $single_promo = ( 1 === count( $applied ) );
+
         foreach ( $applied as $promotion_id => $info ) {
             if ( ! is_array( $info ) ) {
                 continue;
             }
             $external_id = isset( $info['external_id'] ) ? (string) $info['external_id'] : '';
             $coupon_code = isset( $info['coupon_code'] ) ? (string) $info['coupon_code'] : '';
-            $out[] = array(
+            $entry = array(
                 'externalId'     => '' !== $external_id ? $external_id : null,
                 'wooPromotionId' => (int) $promotion_id,
                 'name'           => isset( $info['name'] ) ? (string) $info['name'] : '',
                 'type'           => isset( $info['type'] ) ? (string) $info['type'] : null,
                 'couponCode'     => '' !== $coupon_code ? $coupon_code : null,
                 'discountAmount' => isset( $info['saved'] ) ? (float) $info['saved'] : 0.0,
+                'lines'          => array(),
             );
+            // Only attribute per-line discounts to a single applied promotion (see method doc).
+            if ( $single_promo && ! empty( $order_line_discounts ) ) {
+                $entry['lines'] = $order_line_discounts;
+            }
+            $out[] = $entry;
         }
         return $out;
     }
