@@ -3519,6 +3519,7 @@ class OC_StoreOS_Integration {
         }
 
         if ( ! empty( self::$outgoing_sync_after_creation_done[ $order_id ] ) ) {
+            $this->maybe_debug_log( sprintf( '[OC Giorgio] Outgoing Order: skipped, already_synced_this_request. order_id=%d', (int) $order_id ) );
             return array(
                 'skipped' => true,
                 'reason'  => 'already_synced_this_request',
@@ -3567,8 +3568,27 @@ class OC_StoreOS_Integration {
             );
         }
 
+        // Armed before the call, because send_order_to_storeos() saves the order (sync meta on success,
+        // error meta on failure) and that save re-enters here through woocommerce_update_order.
         self::$outgoing_sync_after_creation_done[ $order_id ] = true;
-        return $this->send_order_to_storeos( $order );
+
+        $result = $this->send_order_to_storeos( $order );
+
+        // Nothing was POSTed, so release the guard: it means "one POST per order per request", and
+        // holding it after a skip locked the order out of its own safety nets. An on-hold Cardcom order
+        // bails out with `waiting_for_cardcom_transaction`, the gateway saves the deal number moments
+        // later in that SAME request, and the `added_post_meta` / `woocommerce_update_order` hooks
+        // re-enter here to send — only to hit `already_synced_this_request` and do nothing. The order
+        // then had to wait for the WP-Cron retry, which on a quiet site runs only on the next page load
+        // (order #19414: entered on-hold 10:11:10, deal number 10:11:11, actually sent 10:19:46).
+        //
+        // Re-entering after a skip is cheap and safe: every gate above re-runs, and a duplicate POST is
+        // still blocked by META_SYNCED plus the payload-hash transient inside send_order_to_storeos().
+        if ( is_array( $result ) && ! empty( $result['skipped'] ) ) {
+            unset( self::$outgoing_sync_after_creation_done[ $order_id ] );
+        }
+
+        return $result;
     }
 
     /**
