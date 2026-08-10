@@ -46,6 +46,13 @@ class OC_StoreOS_Integration {
     const META_CARDCOM_INTERNAL_DEAL_NUMBER = 'CardcomInternalDealNumber';
 
     /**
+     * woo-cardcom-payment-gateway flag: has the J5 hold actually been charged ('no' while pending).
+     * The ONLY meta that says the money moved — the deal number above is written at the
+     * AUTHORIZATION stage and survives a failed capture. {@see get_cardcom_capture_state}.
+     */
+    const META_CARDCOM_CHARGE_CAPTURED = 'cardcom_charge_captured';
+
+    /**
      * Saved Cardcom token expiry month/year on the order (woo-cardcom-payment-gateway).
      */
     const META_CARDCOM_TOKEN_EXPIRY_MONTH = 'CardcomToken_expiry_month';
@@ -1037,6 +1044,79 @@ class OC_StoreOS_Integration {
     }
 
     /**
+     * Cardcom capture state for an order, read from the gateway's own flag.
+     *
+     * woo-cardcom-payment-gateway keeps {@see META_CARDCOM_CHARGE_CAPTURED} at 'no' while a J5 hold is
+     * waiting to be charged and flips it once the charge actually goes through. That flag is the only
+     * signal that says the money moved. The Cardcom deal number ({@see META_CARDCOM_PAYMENT_ID} /
+     * {@see META_CARDCOM_INTERNAL_DEAL_NUMBER}) is written at the AUTHORIZATION stage and stays on the
+     * order even when the later capture fails, so it must never be read as "charged".
+     *
+     * 'unknown' is returned when the flag is absent: flows without a hold (direct charge, token charge,
+     * a non-Cardcom gateway) never write it, and those keep their previous behaviour.
+     *
+     * Filter: `oc_storeos_cardcom_capture_state` — for a gateway build that records capture elsewhere.
+     *
+     * @param WC_Order $order Order.
+     * @return string 'captured'|'not_captured'|'unknown'
+     */
+    protected function get_cardcom_capture_state( WC_Order $order ) {
+        $raw = $order->get_meta( self::META_CARDCOM_CHARGE_CAPTURED, true );
+
+        if ( is_bool( $raw ) ) {
+            $state = $raw ? 'captured' : 'not_captured';
+        } else {
+            $value = strtolower( trim( (string) $raw ) );
+            if ( '' === $value ) {
+                $state = 'unknown';
+            } elseif ( in_array( $value, array( 'no', '0', 'false', 'pending' ), true ) ) {
+                $state = 'not_captured';
+            } else {
+                $state = 'captured';
+            }
+        }
+
+        return (string) apply_filters( 'oc_storeos_cardcom_capture_state', $state, $order );
+    }
+
+    /**
+     * Cardcom capture outcome for the incoming-REST response, read after the payload was saved.
+     *
+     * The capture runs inside the transition to `completed` (the gateway hooks
+     * `woocommerce_order_status_completed` at priority 10), i.e. during the `$order->save()` that
+     * applies the incoming payload. On the gateway side a failed capture is an order note plus a log
+     * line, never an exception — so without this check the endpoint answers 200 / `success: true` and
+     * Giorgio records an order that was never charged.
+     *
+     * Returns null when no capture is expected: another gateway, or an order that is not completed
+     * (a pending hold is the normal state there and must not be reported as a failure).
+     *
+     * @param WC_Order $order Saved order.
+     * @return array|null Keys: `status` ('captured'|'not_captured'|'unknown'), `gateway`.
+     */
+    protected function build_rest_payment_capture_summary( WC_Order $order ) {
+        if ( self::GATEWAY_CARDCOM !== (string) $order->get_payment_method() ) {
+            return null;
+        }
+        if ( 'completed' !== (string) $order->get_status() ) {
+            return null;
+        }
+
+        // The gateway wrote the flag on its own order instance during the transition; re-read from the
+        // database so we judge the capture on persisted state rather than on our pre-capture copy.
+        wp_cache_delete( 'order-' . $order->get_id(), 'orders' );
+        $fresh = wc_get_order( $order->get_id() );
+        if ( $fresh instanceof WC_Order ) {
+            $order = $fresh;
+        }
+
+        return array(
+            'status'  => $this->get_cardcom_capture_state( $order ),
+            'gateway' => self::GATEWAY_CARDCOM,
+        );
+    }
+
+    /**
      * לפני חיוב טוקן Cardcom (priority 10): מאלץ calculate_totals + save כדי ש־initTerminal עם wc_get_order יראה סכום מעודכן.
      *
      * @param int               $order_id Order ID.
@@ -1055,7 +1135,7 @@ class OC_StoreOS_Integration {
         if ( self::GATEWAY_CARDCOM !== $order->get_payment_method() ) {
             return;
         }
-        if ( 'no' !== (string) $order->get_meta( 'cardcom_charge_captured', true ) ) {
+        if ( 'not_captured' !== $this->get_cardcom_capture_state( $order ) ) {
             return;
         }
 
@@ -1403,6 +1483,31 @@ class OC_StoreOS_Integration {
             $order->calculate_totals();
             $order->save(); // כאן הכל נשמר ב-Database בפעם אחת
 
+            // חיוב מסגרת של Cardcom רץ בתוך המעבר ל-completed, כלומר בתוך ה-save שלמעלה.
+            // כישלון שלו הוא הערת הזמנה בלבד — בלי הבדיקה הזו הבקשה חוזרת 200/success ו-Giorgio רושם "חויב".
+            $payment_capture           = $this->build_rest_payment_capture_summary( $order );
+            $capture_failed            = ( is_array( $payment_capture ) && 'not_captured' === $payment_capture['status'] );
+            $report_capture_as_failure = $capture_failed
+                && (bool) apply_filters( 'oc_storeos_rest_fail_response_on_capture_failure', true, $order );
+
+            if ( $capture_failed ) {
+                $this->oc_storeos_wc_log(
+                    'error',
+                    sprintf(
+                        'Cardcom capture not confirmed after incoming REST set status=completed. order_id=%d total=%s reported_to_giorgio_as_failure=%s',
+                        (int) $order->get_id(),
+                        (string) $order->get_total(),
+                        $report_capture_as_failure ? 'yes' : 'no'
+                    ),
+                    array( 'order_id' => (int) $order->get_id() )
+                );
+                $order->add_order_note(
+                    __( '⚠ חיוב מסגרת Cardcom לא אושר: ההזמנה עברה ל"הושלמה" אך הכסף לא נגבה (קיימת תפיסת מסגרת בלבד). לבדוק את יומן Cardcom לפני שחרור ההזמנה.', 'oc-storeos-integration' ),
+                    false,
+                    false
+                );
+            }
+
             // --- בדיקת התאמה: סכומים ופריטים -------------------------------------------
             // Giorgio שולח מחירים ברוטו (כולל מע"מ): orderTotal הוא הסכום שהלקוח משלם.
             // נשווה אותו מול הסכום ש-WooCommerce חישב אחרי השמירה. פער בדרך כלל אומר:
@@ -1503,6 +1608,13 @@ class OC_StoreOS_Integration {
 
             $http_status = $updating_existing ? 200 : 201;
 
+            // Never answer 2xx/success for an order whose charge did not go through — that response is
+            // what Giorgio reads as "the transaction was captured". Filter above turns this off if the
+            // Giorgio client must keep receiving 200 for the order-record update itself.
+            if ( $report_capture_as_failure ) {
+                $http_status = 409;
+            }
+
             $line_items_after = count( $order->get_items() );
 
             if ( $updating_existing ) {
@@ -1551,24 +1663,31 @@ class OC_StoreOS_Integration {
                     'items_unresolved'      => $items_unresolved_keys,
                     'reconciliation'        => $reconciliation,
                     'storeos_sync'          => $storeos_sync_summary,
+                    'payment_capture'       => $payment_capture,
                     'http_response'         => $http_status,
                 )
             );
 
-            return new WP_REST_Response(
-                array(
-                    'success'         => true,
-                    'orderOperation'  => $updating_existing ? 'updated' : 'created',
-                    'storeosSync'     => $storeos_sync_summary,
-                    'reconciliation'  => $reconciliation,
-                    'orderId'         => $order->get_id(),
-                    'orderKey'        => $order->get_order_key(),
-                    'status'          => $order->get_status(),
-                    'orderDate'       => $order->get_date_created() ? $order->get_date_created()->date( 'c' ) : null,
-                    'outgoingSync'    => $outgoing_sync,
-                ),
-                $http_status
+            $response_body = array(
+                'success'         => ! $report_capture_as_failure,
+                'orderOperation'  => $updating_existing ? 'updated' : 'created',
+                'storeosSync'     => $storeos_sync_summary,
+                'reconciliation'  => $reconciliation,
+                'orderId'         => $order->get_id(),
+                'orderKey'        => $order->get_order_key(),
+                'status'          => $order->get_status(),
+                'orderDate'       => $order->get_date_created() ? $order->get_date_created()->date( 'c' ) : null,
+                'outgoingSync'    => $outgoing_sync,
             );
+
+            if ( null !== $payment_capture ) {
+                $response_body['paymentCapture'] = $payment_capture;
+            }
+            if ( $capture_failed ) {
+                $response_body['error'] = __( 'ההזמנה עודכנה, אך חיוב מסגרת Cardcom לא אושר — הכסף לא נגבה.', 'oc-storeos-integration' );
+            }
+
+            return new WP_REST_Response( $response_body, $http_status );
         } catch ( Exception $e ) {
             $this->log_rest_incoming_order(
                 array(
@@ -5084,6 +5203,11 @@ class OC_StoreOS_Integration {
         self::$payment_webhook_v2_dispatching[ $order_id ] = true;
 
         try {
+            // Read persisted state: the capture flag is written by the Cardcom gateway earlier in this
+            // same request (status_completed, priority 10), and a cached order object would hand us the
+            // pre-capture meta — exactly the stale read that made a failed capture look like a payment.
+            wp_cache_delete( 'order-' . $order_id, 'orders' );
+
             $order = wc_get_order( $order_id );
             if ( ! $order instanceof WC_Order ) {
                 $this->oc_storeos_wc_log(
@@ -5115,12 +5239,13 @@ class OC_StoreOS_Integration {
             $this->oc_storeos_wc_log(
                 'info',
                 sprintf(
-                    'OrderPayment v2: ready to send. order_id=%d profile=%s payment=%s wc_txn=%s cardcom_meta=%s payload_status=%s',
+                    'OrderPayment v2: ready to send. order_id=%d profile=%s payment=%s wc_txn=%s cardcom_meta=%s capture=%s payload_status=%s',
                     (int) $order_id,
                     $profile,
                     $order->get_payment_method_title() . ' / ' . $order->get_payment_method(),
                     (string) $order->get_transaction_id(),
                     (string) $order->get_meta( self::META_CARDCOM_PAYMENT_ID, true ),
+                    $this->get_cardcom_capture_state( $order ),
                     isset( $payload['status'] ) ? (string) $payload['status'] : ''
                 ),
                 array(
@@ -5199,6 +5324,12 @@ class OC_StoreOS_Integration {
      * optional {@see get_cardcom_invoice_number_for_order_payment} inside payment;
      * {@see resolve_payment_label_for_payload} as payment.paymentGateway (same as outgoing order paymentlabel).
      *
+     * `status` is driven by {@see get_cardcom_capture_state}, NOT by the presence of the deal number:
+     * the deal number is written when the J5 hold is placed and survives a failed capture, so reading
+     * it as proof of payment reported orders to Giorgio as charged when only the hold existed.
+     * A hold whose capture did not go through is reported as `failed` + `gatewayPaymentStatus:
+     * authorized`, so Giorgio can tell "money never moved" apart from "no card details at all".
+     *
      * @param WC_Order $order Order.
      *
      * @return array
@@ -5213,7 +5344,17 @@ class OC_StoreOS_Integration {
             if ( '' === $transaction_id ) {
                 $transaction_id = trim( (string) $order->get_meta( self::META_CARDCOM_INTERNAL_DEAL_NUMBER, true ) );
             }
-            $status = ( '' !== $transaction_id ) ? 'success' : 'failed';
+
+            $capture_state = $this->get_cardcom_capture_state( $order );
+
+            if ( 'not_captured' === $capture_state ) {
+                // Hold placed, charge did not go through. Never report this as paid.
+                $status = 'failed';
+            } else {
+                // 'captured', or 'unknown' for flows that never write the flag (direct/token charge) —
+                // those keep the previous deal-number behaviour.
+                $status = ( '' !== $transaction_id ) ? 'success' : 'failed';
+            }
 
             $payload = array(
                 'orderId' => (int) $order->get_id(),
@@ -5241,7 +5382,25 @@ class OC_StoreOS_Integration {
                 $payload['gatewayPaymentStatus'] = 'authorized';
                 $payload['gatewayIsFinished']    = 'false';
                 // Giorgio: mark final charge (likiut) as finished outside the payment object.
-                $payload['isFinished'] = ( 'completed' === (string) $order->get_status() ) ? 'true' : 'false';
+                // Driven by the capture flag; the WC status alone is not proof — Giorgio itself pushes
+                // `completed` over REST, which would otherwise self-confirm an uncharged order.
+                if ( 'captured' === $capture_state ) {
+                    $payload['isFinished'] = 'true';
+                } else {
+                    $payload['isFinished'] = ( 'completed' === (string) $order->get_status() ) ? 'true' : 'false';
+                }
+            } else {
+                $payload['payment'] = array(
+                    'paymentGateway' => 'cardcom',
+                );
+                $payload['gatewayIsFinished'] = 'false';
+                $payload['isFinished']        = 'false';
+
+                if ( 'not_captured' === $capture_state ) {
+                    // There IS a valid hold on the card — the capture is what failed.
+                    $payload['gatewayPaymentStatus'] = 'authorized';
+                    $payload['failureReason']        = 'cardcom_capture_not_confirmed';
+                }
             }
 
             return $this->apply_order_payment_webhook_v2_common_fields( $order, $payload );
