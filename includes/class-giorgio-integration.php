@@ -1068,33 +1068,72 @@ class OC_StoreOS_Integration {
      * 'unknown' is returned when the flag is absent: flows without a hold (direct charge, token charge,
      * a non-Cardcom gateway) never write it, and those keep their previous behaviour.
      *
+     * The flag can be stored more than once on one order — a second payment attempt adds a row instead
+     * of replacing the first. The NEWEST row wins, because it is the one that describes how the order
+     * ended: an attempt that failed and left 'no' followed by an attempt that succeeded and wrote 'yes'
+     * is a paid order, and reading any earlier row would report it as failed. Mixed values are logged.
+     *
      * Filter: `oc_storeos_cardcom_capture_state` — for a gateway build that records capture elsewhere.
      *
      * @param WC_Order $order Order.
      * @return string 'captured'|'not_captured'|'unknown'
      */
     protected function get_cardcom_capture_state( WC_Order $order ) {
-        // Straight from the database: the gateway writes this flag from its own code path, on its own
-        // order instance, during the same request we are judging. {@see get_order_meta_uncached}.
-        $raw = $this->get_order_meta_uncached( $order->get_id(), self::META_CARDCOM_CHARGE_CAPTURED );
-        if ( null === $raw ) {
-            $raw = $order->get_meta( self::META_CARDCOM_CHARGE_CAPTURED, true );
-        }
+        $order_id = $order->get_id();
 
-        if ( is_bool( $raw ) ) {
-            $state = $raw ? 'captured' : 'not_captured';
+        // Straight from the database: the gateway writes this flag from its own code path, on its own
+        // order instance, during the same request we are judging. {@see get_order_meta_values_uncached}.
+        $values = $this->get_order_meta_values_uncached( $order_id, self::META_CARDCOM_CHARGE_CAPTURED );
+
+        if ( empty( $values ) ) {
+            $state = $this->normalize_cardcom_capture_value( $order->get_meta( self::META_CARDCOM_CHARGE_CAPTURED, true ) );
         } else {
-            $value = strtolower( trim( (string) $raw ) );
-            if ( '' === $value ) {
-                $state = 'unknown';
-            } elseif ( in_array( $value, array( 'no', '0', 'false', 'pending' ), true ) ) {
-                $state = 'not_captured';
-            } else {
-                $state = 'captured';
+            $state = $this->normalize_cardcom_capture_value( end( $values ) );
+
+            // Two attempts that disagree. The newest row is still the right answer, but this is worth
+            // seeing in the log: it means one order carries more than one payment attempt.
+            $distinct = array_unique( array_map( array( $this, 'normalize_cardcom_capture_value' ), $values ) );
+            if ( count( $distinct ) > 1 ) {
+                $this->oc_storeos_wc_log(
+                    'warning',
+                    sprintf(
+                        'Cardcom capture flag stored more than once with different values on order %d: [%s] (oldest first). Using the newest row → %s.',
+                        (int) $order_id,
+                        implode( ', ', $values ),
+                        $state
+                    ),
+                    array( 'order_id' => (int) $order_id )
+                );
             }
         }
 
         return (string) apply_filters( 'oc_storeos_cardcom_capture_state', $state, $order );
+    }
+
+    /**
+     * One stored value of {@see META_CARDCOM_CHARGE_CAPTURED} → capture state.
+     *
+     * On delinka the gateway only ever writes 'yes' or 'no'; the other spellings are accepted so a
+     * different gateway build cannot land in 'captured' by writing a falsey value we did not expect.
+     *
+     * @param mixed $raw Stored value.
+     * @return string 'captured'|'not_captured'|'unknown'
+     */
+    protected function normalize_cardcom_capture_value( $raw ) {
+        if ( is_bool( $raw ) ) {
+            return $raw ? 'captured' : 'not_captured';
+        }
+
+        $value = strtolower( trim( (string) $raw ) );
+
+        if ( '' === $value ) {
+            return 'unknown';
+        }
+        if ( in_array( $value, array( 'no', '0', 'false', 'pending' ), true ) ) {
+            return 'not_captured';
+        }
+
+        return 'captured';
     }
 
     /**
@@ -3735,6 +3774,54 @@ class OC_StoreOS_Integration {
         }
 
         return null === $value ? null : (string) $value;
+    }
+
+    /**
+     * Every value stored under one order meta key, oldest row first, straight from the database.
+     *
+     * WooCommerce meta is not unique per key: a gateway that writes the same key on a second payment
+     * attempt adds a ROW rather than replacing the first one. Order 18326 on delinka carries two
+     * `cardcom_charge_captured` rows, two `cardcom_token_val` rows, and two `cardcom_CardOwnerID` rows
+     * — two attempts, from two different cards, on one order. `get_meta()` and a `LIMIT 1` read both
+     * answer with the OLDEST row, which for a payment flag is the stale one.
+     *
+     * Ordered by the auto-increment id, so the last entry is the most recent write.
+     *
+     * @param int    $order_id Order ID.
+     * @param string $meta_key Meta key.
+     * @return array<int, string> Values in write order; empty when the key is not stored.
+     */
+    protected function get_order_meta_values_uncached( $order_id, $meta_key ) {
+        global $wpdb;
+
+        $order_id = (int) $order_id;
+        if ( $order_id < 1 ) {
+            return array();
+        }
+
+        $values = $wpdb->get_col(
+            $wpdb->prepare(
+                "SELECT meta_value FROM {$wpdb->postmeta} WHERE post_id = %d AND meta_key = %s ORDER BY meta_id ASC",
+                $order_id,
+                (string) $meta_key
+            )
+        );
+
+        // HPOS: order meta lives in its own table, keyed by its own auto-increment id.
+        if ( empty( $values ) ) {
+            $table = $wpdb->prefix . 'wc_orders_meta';
+            if ( $table === $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $table ) ) ) {
+                $values = $wpdb->get_col(
+                    $wpdb->prepare(
+                        "SELECT meta_value FROM {$table} WHERE order_id = %d AND meta_key = %s ORDER BY id ASC",
+                        $order_id,
+                        (string) $meta_key
+                    )
+                );
+            }
+        }
+
+        return is_array( $values ) ? array_map( 'strval', $values ) : array();
     }
 
     /**
