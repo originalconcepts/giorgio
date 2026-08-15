@@ -11,6 +11,9 @@ class OC_StoreOS_Integration {
     const META_LAST_ERR  = '_oc_storeos_last_error';
     const META_LAST_SYNC = '_oc_storeos_last_sync';
 
+    /** Hash of the last OrderPayment v2 payload Giorgio accepted — cross-request duplicate guard. */
+    const META_PAYMENT_WEBHOOK_V2_HASH = '_oc_storeos_payment_webhook_v2_hash';
+
     /** @var string Uploads-relative directory for REST incoming log. */
     const REST_INCOMING_LOG_DIR = 'giorgio';
 
@@ -29,6 +32,16 @@ class OC_StoreOS_Integration {
 
     /** Seconds: ignore identical outgoing Order payload when repeated (double webhook / HTTP retry). */
     const OUT_ORDER_DEDUP_TTL = 45;
+
+    /**
+     * Cross-request lock rows in wp_options ({@see acquire_lock}). Every guard that came before this one
+     * — META_SYNCED, the payload-hash transient, the per-request static flags — is read BEFORE the work
+     * and written AFTER it, so two PHP processes that enter within the same few seconds both pass.
+     */
+    const LOCK_OPTION_PREFIX = 'oc_storeos_lock_';
+
+    /** Seconds after which a lock row is considered abandoned (request died mid-flight) and may be taken. */
+    const LOCK_TTL = 120;
 
     /**
      * Payment-method row: "do not send order to Giorgio for this gateway" (per-method override).
@@ -3494,7 +3507,124 @@ class OC_StoreOS_Integration {
     }
 
     /**
-     * Single POST per order per request when the order matches the configured trigger (and has line items).
+     * Claim a named lock that holds ACROSS PHP processes, not just within one request.
+     *
+     * Why this exists: order 18347 (delinka, 2026-08-14 11:19:54) was POSTed to Giorgio twice, four
+     * seconds apart, and both POSTs passed every guard we had. All of them are check-then-act —
+     * META_SYNCED is read, the payload is built (4s on that order), the payload-hash transient is
+     * checked, the POST runs, and only then are META_SYNCED and the transient written. Two requests
+     * that enter that window both see "not synced yet". The static per-request flags cannot help:
+     * they live in one process. Same signature on zano-dagim (order 43130, senders 2s apart).
+     *
+     * Implementation is WP core's lock pattern ({@see WP_Upgrader::create_lock}): INSERT IGNORE against
+     * the UNIQUE option_name index, which is atomic in MySQL — exactly one caller gets rows_affected=1.
+     * Goes through $wpdb on purpose: add_option()/get_option() read through the object cache, and a
+     * persistent cache (Redis) would happily serve a stale "no lock here" to the second process.
+     *
+     * @param string $key Lock name, unique per resource (e.g. "out_order_18347").
+     * @param int    $ttl Seconds before an existing lock counts as abandoned.
+     * @return bool True when the caller owns the lock and must release it.
+     */
+    protected function acquire_lock( $key, $ttl = self::LOCK_TTL ) {
+        global $wpdb;
+
+        $option = self::LOCK_OPTION_PREFIX . $key;
+        $now    = time();
+
+        $inserted = $wpdb->query(
+            $wpdb->prepare(
+                "INSERT IGNORE INTO {$wpdb->options} (option_name, option_value, autoload) VALUES (%s, %s, 'no')",
+                $option,
+                (string) $now
+            )
+        );
+        if ( 1 === (int) $inserted ) {
+            return true;
+        }
+
+        // Row already there. Take it over only when it is older than the TTL, i.e. the owning request
+        // died before its finally-block ran. CAST so this compares as a number, not as text.
+        $stolen = $wpdb->query(
+            $wpdb->prepare(
+                "UPDATE {$wpdb->options} SET option_value = %s
+                 WHERE option_name = %s AND CAST(option_value AS UNSIGNED) < %d",
+                (string) $now,
+                $option,
+                $now - (int) $ttl
+            )
+        );
+
+        return ( 1 === (int) $stolen );
+    }
+
+    /**
+     * Release a lock taken by {@see acquire_lock}. Always call from a finally block.
+     *
+     * @param string $key Lock name.
+     */
+    protected function release_lock( $key ) {
+        global $wpdb;
+
+        $option = self::LOCK_OPTION_PREFIX . $key;
+        $wpdb->delete( $wpdb->options, array( 'option_name' => $option ), array( '%s' ) );
+        wp_cache_delete( $option, 'options' );
+    }
+
+    /**
+     * Read one order meta value straight from the database, bypassing the order object and every cache.
+     *
+     * Used inside a lock: the point of re-reading there is to catch a sibling request that finished
+     * while we were queued, and a cached order object is exactly what would hide that.
+     *
+     * @param int    $order_id Order ID.
+     * @param string $meta_key Meta key.
+     * @return string|null Null when the row does not exist.
+     */
+    protected function get_order_meta_uncached( $order_id, $meta_key ) {
+        global $wpdb;
+
+        $order_id = (int) $order_id;
+        if ( $order_id < 1 ) {
+            return null;
+        }
+
+        $value = $wpdb->get_var(
+            $wpdb->prepare(
+                "SELECT meta_value FROM {$wpdb->postmeta} WHERE post_id = %d AND meta_key = %s LIMIT 1",
+                $order_id,
+                (string) $meta_key
+            )
+        );
+
+        // HPOS: order meta lives in its own table, so the postmeta read above finds nothing.
+        if ( null === $value ) {
+            $table = $wpdb->prefix . 'wc_orders_meta';
+            if ( $table === $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $table ) ) ) {
+                $value = $wpdb->get_var(
+                    $wpdb->prepare(
+                        "SELECT meta_value FROM {$table} WHERE order_id = %d AND meta_key = %s LIMIT 1",
+                        $order_id,
+                        (string) $meta_key
+                    )
+                );
+            }
+        }
+
+        return null === $value ? null : (string) $value;
+    }
+
+    /**
+     * Whether the order is already marked as synced, read uncached. {@see get_order_meta_uncached}.
+     *
+     * @param int $order_id Order ID.
+     * @return bool
+     */
+    protected function is_order_synced_uncached( $order_id ) {
+        return 1 === (int) $this->get_order_meta_uncached( $order_id, self::META_SYNCED );
+    }
+
+    /**
+     * One POST per order, across requests: gates, then the cross-process lock, then send.
      *
      * @param WC_Order|null $order   Order.
      * @param array         $context Optional. `skip_status_gate` — for incoming REST echo (ignore WC status trigger).
@@ -3572,7 +3702,42 @@ class OC_StoreOS_Integration {
         // error meta on failure) and that save re-enters here through woocommerce_update_order.
         self::$outgoing_sync_after_creation_done[ $order_id ] = true;
 
-        $result = $this->send_order_to_storeos( $order );
+        // The real duplicate guard: held from before the payload is built until after META_SYNCED is
+        // written, so a sibling request cannot slip through that window. See acquire_lock().
+        $lock_key = 'out_order_' . $order_id;
+
+        if ( ! $this->acquire_lock( $lock_key ) ) {
+            unset( self::$outgoing_sync_after_creation_done[ $order_id ] );
+            $this->oc_storeos_wc_log(
+                'info',
+                sprintf( 'Outgoing Order: skipped — another request holds the lock for this order. order_id=%d', (int) $order_id ),
+                array( 'order_id' => (int) $order_id )
+            );
+
+            return array(
+                'skipped' => true,
+                'reason'  => 'locked_by_another_request',
+            );
+        }
+
+        try {
+            // Re-read from the DB now that we own the lock: the request we waited for may have synced.
+            if ( $this->is_order_synced_uncached( $order_id ) ) {
+                $this->oc_storeos_wc_log(
+                    'info',
+                    sprintf( 'Outgoing Order: skipped — order was synced by another request while waiting. order_id=%d', (int) $order_id ),
+                    array( 'order_id' => (int) $order_id )
+                );
+                $result = array(
+                    'skipped' => true,
+                    'reason'  => 'already_synced_to_storeos',
+                );
+            } else {
+                $result = $this->send_order_to_storeos( $order );
+            }
+        } finally {
+            $this->release_lock( $lock_key );
+        }
 
         // Nothing was POSTed, so release the guard: it means "one POST per order per request", and
         // holding it after a skip locked the order out of its own safety nets. An on-hold Cardcom order
@@ -3822,6 +3987,94 @@ class OC_StoreOS_Integration {
         }
         $v = $order->get_meta( $billing_meta_key, true );
         return is_string( $v ) ? sanitize_text_field( $v ) : '';
+    }
+
+    /**
+     * נמען המשלוח בפועל — "שליחה למישהו אחר" של OC Woo Shipping.
+     *
+     * כשלקוח מזמין עבור אדם אחר, פרטי המזמין נשארים ב-billing ופרטי הנמען נשמרים ב-
+     * `ocws_recipient_*` (ובשדות המשלוח הסטנדרטיים של WooCommerce). בלי לשלוח אותם ל-Giorgio
+     * ההזמנה נראית שם על שם המזמין והמשלוח יוצא אליו במקום אל הנמען.
+     *
+     * סדר מקורות: `ocws_recipient_firstname|lastname|phone` → `_shipping_first_name|_shipping_last_name` /
+     * `get_shipping_phone()` → `_shipping_phone`.
+     *
+     * `isOther` נקבע לפי `ocws_other_recipient`, ואם הוא ריק — לפי השוואת שם/טלפון מול ה-billing
+     * (צ׳קאאוט ישן/הזמנה שנערכה ידנית לא תמיד מסמן את הדגל). פילטר: `oc_storeos_order_has_other_recipient`.
+     *
+     * @param WC_Order $order Order.
+     * @return array name (string), phone (string), isOther (bool).
+     */
+    protected function get_delivery_recipient_for_payload( $order ) {
+        $empty = array(
+            'name'    => '',
+            'phone'   => '',
+            'isOther' => false,
+        );
+
+        if ( ! $order instanceof WC_Order ) {
+            return $empty;
+        }
+
+        $first = trim( (string) $order->get_meta( 'ocws_recipient_firstname', true ) );
+        $last  = trim( (string) $order->get_meta( 'ocws_recipient_lastname', true ) );
+        $phone = trim( (string) $order->get_meta( 'ocws_recipient_phone', true ) );
+
+        if ( '' === $first && '' === $last ) {
+            $first = trim( (string) $order->get_shipping_first_name() );
+            $last  = trim( (string) $order->get_shipping_last_name() );
+        }
+
+        if ( '' === $phone && method_exists( $order, 'get_shipping_phone' ) ) {
+            $phone = trim( (string) $order->get_shipping_phone() );
+        }
+        if ( '' === $phone ) {
+            $phone = trim( (string) $order->get_meta( '_shipping_phone', true ) );
+        }
+
+        $name = trim( $first . ' ' . $last );
+        if ( '' === $name && '' === $phone ) {
+            return $empty;
+        }
+
+        $flag     = $order->get_meta( 'ocws_other_recipient', true );
+        $is_other = ! empty( $flag ) && '0' !== (string) $flag;
+
+        if ( ! $is_other ) {
+            $billing_name  = trim( $order->get_billing_first_name() . ' ' . $order->get_billing_last_name() );
+            $billing_phone = (string) $order->get_billing_phone();
+
+            $name_differs  = ( '' !== $name && $this->normalize_text_for_compare( $name ) !== $this->normalize_text_for_compare( $billing_name ) );
+            $phone_differs = ( '' !== $phone && '' !== $billing_phone && $this->normalize_phone_for_compare( $phone ) !== $this->normalize_phone_for_compare( $billing_phone ) );
+
+            $is_other = $name_differs || $phone_differs;
+        }
+
+        return array(
+            'name'    => sanitize_text_field( $name ),
+            'phone'   => sanitize_text_field( $phone ),
+            'isOther' => (bool) apply_filters( 'oc_storeos_order_has_other_recipient', $is_other, $order ),
+        );
+    }
+
+    /**
+     * השוואת שמות: רווחים כפולים/רווחים נסתרים לא הופכים שם זהה לשונה.
+     *
+     * @param string $value Value.
+     * @return string
+     */
+    protected function normalize_text_for_compare( $value ) {
+        return trim( preg_replace( '/\s+/u', ' ', (string) $value ) );
+    }
+
+    /**
+     * השוואת טלפונים: רק ספרות (050-434-2012 ו-0504342012 הם אותו מספר).
+     *
+     * @param string $value Value.
+     * @return string
+     */
+    protected function normalize_phone_for_compare( $value ) {
+        return preg_replace( '/\D+/', '', (string) $value );
     }
 
     /**
@@ -4099,6 +4352,41 @@ class OC_StoreOS_Integration {
         $customer_phone = $order->get_billing_phone();
         $customer_email = $order->get_billing_email();
 
+        // נמען המשלוח כשההזמנה בוצעה עבור מישהו אחר — נשלח בנפרד מהמזמין (billing).
+        $recipient = $this->get_delivery_recipient_for_payload( $order );
+
+        // ברירת המחדל: `customer` = המזמין/המשלם (חיוב, CRM, חשבונית).
+        // אתר שמעדיף שההזמנה תופיע ב-Giorgio על שם הנמען יפעיל את הפילטר הזה.
+        if ( $recipient['isOther'] && apply_filters( 'oc_storeos_send_recipient_as_customer', false, $order, $recipient ) ) {
+            if ( '' !== $recipient['name'] ) {
+                $customer_name = $recipient['name'];
+            }
+            if ( '' !== $recipient['phone'] ) {
+                $customer_phone = $recipient['phone'];
+            }
+        }
+
+        // הערות ללקוח: שורת נמען בראש ההערות, כדי שהליקוט/הנהג יראו את הנמען הנכון גם לפני
+        // ש-Giorgio יתמכו בשדות `recipient*` הייעודיים. כיבוי: `oc_storeos_prepend_recipient_to_customer_notes`.
+        $customer_notes = (string) $order->get_meta( '_billing_notes' );
+
+        if ( $recipient['isOther']
+            && ( '' !== $recipient['name'] || '' !== $recipient['phone'] )
+            && apply_filters( 'oc_storeos_prepend_recipient_to_customer_notes', true, $order, $recipient )
+        ) {
+            $recipient_line = __( 'משלוח עבור:', 'oc-storeos-integration' );
+            if ( '' !== $recipient['name'] ) {
+                $recipient_line .= ' ' . $recipient['name'];
+            }
+            if ( '' !== $recipient['phone'] ) {
+                $recipient_line .= ' | ' . __( 'טלפון:', 'oc-storeos-integration' ) . ' ' . $recipient['phone'];
+            }
+
+            $customer_notes = '' !== trim( $customer_notes )
+                ? $recipient_line . "\n" . $customer_notes
+                : $recipient_line;
+        }
+
         // Prefer OC Woo Shipping human-readable city (not Google place_id in WC city field).
         $shipping_city = $this->resolve_shipping_city_for_storeos_payload( $order );
 
@@ -4304,12 +4592,29 @@ class OC_StoreOS_Integration {
             'items'           => $items_payload,
             'shippingTotal'   => (float) $order->get_shipping_total(),
             'orderTotal'      => (float) $order->get_total(),
-            'customerNotes'   => $order->get_meta('_billing_notes'),
+            'customerNotes'   => $customer_notes,
             // Promotions actually applied by the Promotion Engine on this order, so Giorgio records the
             // real promotion (not a re-evaluation) and avoids the /redemptions double-count. Always present
             // ([] = no promotions) so the consumer can tell "none" from "not sent".
             'appliedPromotions' => $this->build_applied_promotions_for_payload( $order ),
         );
+
+        // שדות הנמען. תמיד נשלחים (isOther=false בהזמנה רגילה) כדי ש-Giorgio יבדיל בין
+        // "אין נמען אחר" לבין "לא נשלח". כיבוי מהיר בלי שינוי קוד אם ה-API יסרב שדות לא מוכרים:
+        // add_filter( 'oc_storeos_send_recipient_fields', '__return_false' );
+        if ( apply_filters( 'oc_storeos_send_recipient_fields', true, $order, $recipient ) ) {
+            $recipient_name  = '' !== $recipient['name'] ? $recipient['name'] : $customer_name;
+            $recipient_phone = '' !== $recipient['phone'] ? $recipient['phone'] : $customer_phone;
+
+            $payload['shippingAddress']['recipientName']  = $recipient_name;
+            $payload['shippingAddress']['recipientPhone'] = $recipient_phone;
+
+            $payload['recipient'] = array(
+                'name'    => $recipient_name,
+                'phone'   => $recipient_phone,
+                'isOther' => $recipient['isOther'],
+            );
+        }
 
         $shipping_label = $this->resolve_shipping_label_for_payload( $order, $options );
         if ( '' !== $shipping_label ) {
@@ -4854,6 +5159,10 @@ class OC_StoreOS_Integration {
                 'X-Api-Key'     => $options['api_token'],
                 'Authorization' => 'Bearer ' . $options['api_token'],
                 'Content-Type'  => 'application/json',
+                // Stable per ORDER, not per attempt: the same order retried tomorrow still carries the
+                // same key, so Giorgio can return the existing order instead of opening a second one.
+                // Belt and braces next to our own lock — it also covers sites still on older plugin builds.
+                'X-Idempotency-Key' => sprintf( '%s-%d', (string) ( $options['site_id'] ?? '' ), (int) $order->get_id() ),
             ),
             'body'        => wp_json_encode( $payload ),
             'data_format' => 'body',
@@ -5103,6 +5412,20 @@ class OC_StoreOS_Integration {
 
         self::$payment_webhook_v2_dispatching[ $order_id ] = true;
 
+        // Same race as the outgoing Order: order 18347 sent three OrderPayment calls from three
+        // different requests within two seconds. The static flag above only covers one process.
+        $lock_key = 'payment_wh_' . $order_id;
+
+        if ( ! $this->acquire_lock( $lock_key ) ) {
+            unset( self::$payment_webhook_v2_dispatching[ $order_id ] );
+            $this->oc_storeos_wc_log(
+                'info',
+                sprintf( 'OrderPayment v2: skipped — another request holds the lock for this order. order_id=%d', (int) $order_id ),
+                array( 'order_id' => (int) $order_id )
+            );
+            return;
+        }
+
         try {
             $order = wc_get_order( $order_id );
             if ( ! $order instanceof WC_Order ) {
@@ -5128,7 +5451,27 @@ class OC_StoreOS_Integration {
                 );
                 return;
             }
-            $profile      = $this->resolve_storeos_payment_gateway_profile( $order );
+            $profile = $this->resolve_storeos_payment_gateway_profile( $order );
+
+            // Don't report a Cardcom payment before Cardcom saved its deal number: order 18347 sent two
+            // OrderPayment calls with an empty transactionId (13:03:41) and Giorgio accepted both with
+            // HTTP 200. Nothing is lost by waiting — the hooks fire again once the meta lands, which is
+            // exactly what produced the correct call two seconds later.
+            if ( 'cardcom' === $profile ) {
+                $txn = trim( (string) $order->get_meta( self::META_CARDCOM_PAYMENT_ID, true ) );
+                if ( '' === $txn ) {
+                    $txn = trim( (string) $order->get_meta( self::META_CARDCOM_INTERNAL_DEAL_NUMBER, true ) );
+                }
+                if ( '' === $txn || '0' === $txn ) {
+                    $this->oc_storeos_wc_log(
+                        'notice',
+                        sprintf( 'OrderPayment v2: not sending — Cardcom transaction id not saved yet. order_id=%d', (int) $order_id ),
+                        array( 'order_id' => (int) $order_id )
+                    );
+                    return;
+                }
+            }
+
             $payload      = $this->build_order_payment_webhook_v2_payload( $order );
             $payload_hash = md5( wp_json_encode( $payload ) );
 
@@ -5160,8 +5503,26 @@ class OC_StoreOS_Integration {
                 return;
             }
 
+            // Same check, but surviving the request: the static array above is rebuilt per process, so
+            // an identical payload sent from the next request went out again (three times on 18347).
+            // Escape hatch, since this skip has no expiry: delete the meta key on the order to force a
+            // resend, or turn the check off for a site with
+            // add_filter( 'oc_storeos_skip_identical_payment_webhook', '__return_false' ).
+            $skip_identical = (bool) apply_filters( 'oc_storeos_skip_identical_payment_webhook', true, $order, $payload );
+            $sent_hash      = (string) $this->get_order_meta_uncached( $order_id, self::META_PAYMENT_WEBHOOK_V2_HASH );
+
+            if ( $skip_identical && '' !== $sent_hash && $sent_hash === $payload_hash ) {
+                $this->oc_storeos_wc_log(
+                    'info',
+                    sprintf( 'OrderPayment v2: skip duplicate payload hash (identical payload already accepted). order_id=%d', (int) $order_id ),
+                    array( 'order_id' => (int) $order_id )
+                );
+                return;
+            }
+
             $this->send_order_payment_webhook_v2_request( $order, $payload, $options );
         } finally {
+            $this->release_lock( $lock_key );
             unset( self::$payment_webhook_v2_dispatching[ $order_id ] );
         }
     }
@@ -5405,8 +5766,9 @@ class OC_StoreOS_Integration {
                 sprintf( 'OrderPayment v2: remote OK HTTP %d. order_id=%d', $code, $oid ),
                 array( 'order_id' => $oid )
             );
-            $this->mark_payment_webhook_v2_ok( $order->get_id() );
-            self::$payment_webhook_v2_ok_payload_hash[ $order->get_id() ] = md5( wp_json_encode( $payload ) );
+            $accepted_hash = md5( (string) wp_json_encode( $payload ) );
+            $this->mark_payment_webhook_v2_ok( $order->get_id(), $accepted_hash );
+            self::$payment_webhook_v2_ok_payload_hash[ $order->get_id() ] = $accepted_hash;
 
             $order_note = wc_get_order( $oid );
             if ( $order_note instanceof WC_Order ) {
@@ -5450,13 +5812,21 @@ class OC_StoreOS_Integration {
     }
 
     /**
-     * @param int $order_id Order ID.
+     * @param int    $order_id     Order ID.
+     * @param string $payload_hash Hash of the payload Giorgio accepted, persisted so the next request
+     *                             can recognise an identical resend. {@see META_PAYMENT_WEBHOOK_V2_HASH}.
      */
-    protected function mark_payment_webhook_v2_ok( $order_id ) {
-        $this->set_order_meta_safe( $order_id, array(
+    protected function mark_payment_webhook_v2_ok( $order_id, $payload_hash = '' ) {
+        $meta = array(
             '_oc_storeos_payment_webhook_v2_error' => '',
             '_oc_storeos_payment_webhook_v2_at'    => current_time( 'mysql' ),
-        ) );
+        );
+
+        if ( '' !== (string) $payload_hash ) {
+            $meta[ self::META_PAYMENT_WEBHOOK_V2_HASH ] = (string) $payload_hash;
+        }
+
+        $this->set_order_meta_safe( $order_id, $meta );
     }
 
     /**
