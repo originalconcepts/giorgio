@@ -4845,10 +4845,7 @@ class OC_StoreOS_Integration {
 
         // Outgoing order: payment object (OrderPayment model) with required key names + stable key order.
         $payment_gateway_id = (string) $order->get_payment_method();
-        $transaction_id     = trim( (string) $order->get_meta( self::META_CARDCOM_PAYMENT_ID, true ) );
-        if ( '' === $transaction_id ) {
-            $transaction_id = trim( (string) $order->get_meta( self::META_CARDCOM_INTERNAL_DEAL_NUMBER, true ) );
-        }
+        $transaction_id     = $this->resolve_cardcom_transaction_id_for_payload( $order );
         $invoice_no   = $this->get_cardcom_invoice_number_for_order_payment( $order );
         $cc_last_four = $this->get_cardcom_cc_last_four_for_payload( $order );
         $total_amount = (float) $order->get_total();
@@ -5674,10 +5671,7 @@ class OC_StoreOS_Integration {
             // HTTP 200. Nothing is lost by waiting — the hooks fire again once the meta lands, which is
             // exactly what produced the correct call two seconds later.
             if ( 'cardcom' === $profile ) {
-                $txn = trim( (string) $order->get_meta( self::META_CARDCOM_PAYMENT_ID, true ) );
-                if ( '' === $txn ) {
-                    $txn = trim( (string) $order->get_meta( self::META_CARDCOM_INTERNAL_DEAL_NUMBER, true ) );
-                }
+                $txn = $this->resolve_cardcom_transaction_id_for_payload( $order );
                 if ( '' === $txn || '0' === $txn ) {
                     $this->oc_storeos_wc_log(
                         'notice',
@@ -5793,7 +5787,45 @@ class OC_StoreOS_Integration {
     }
 
     /**
-     * OrderPayment v2 body: Cardcom transaction id from order meta {@see META_CARDCOM_PAYMENT_ID};
+     * Cardcom transaction id for outgoing payloads (Order + OrderPayment v2), newest DB row first.
+     *
+     * After a Capture Charge the gateway rewrites {@see META_CARDCOM_PAYMENT_ID} /
+     * {@see META_CARDCOM_INTERNAL_DEAL_NUMBER} (and the order transaction id) with the capture's NEW
+     * deal number — the original J5/suspended deal keeps answering as a "hold" at Cardcom forever.
+     * Payloads built from a cached order instance in the same request as the capture still carried
+     * the pre-capture deal number, so Giorgio's charge verification queried the hold and raised false
+     * "charged ₪0" mismatch alarms on paid orders (Zano-Dagim). Reading the NEWEST database row,
+     * uncached ({@see get_order_meta_values_uncached}), returns the capture's id once it exists and
+     * the hold's id (the only one there is) before the capture — same duplicate-row rule as
+     * {@see get_cardcom_capture_state}.
+     *
+     * @param WC_Order $order Order.
+     * @return string Transaction id, or '' when none is known.
+     */
+    protected function resolve_cardcom_transaction_id_for_payload( WC_Order $order ) {
+        $order_id = $order->get_id();
+
+        foreach ( array( self::META_CARDCOM_PAYMENT_ID, self::META_CARDCOM_INTERNAL_DEAL_NUMBER ) as $meta_key ) {
+            $values = $this->get_order_meta_values_uncached( $order_id, $meta_key );
+            if ( ! empty( $values ) ) {
+                $newest = trim( (string) end( $values ) );
+                if ( '' !== $newest && '0' !== $newest ) {
+                    return $newest;
+                }
+            }
+        }
+
+        // Cached fallback — keeps the previous behaviour when the uncached query finds nothing
+        // (e.g. the meta only exists on the in-memory instance and was not saved yet).
+        $transaction_id = trim( (string) $order->get_meta( self::META_CARDCOM_PAYMENT_ID, true ) );
+        if ( '' === $transaction_id ) {
+            $transaction_id = trim( (string) $order->get_meta( self::META_CARDCOM_INTERNAL_DEAL_NUMBER, true ) );
+        }
+        return $transaction_id;
+    }
+
+    /**
+     * OrderPayment v2 body: Cardcom transaction id via {@see resolve_cardcom_transaction_id_for_payload};
      * optional {@see get_cardcom_invoice_number_for_order_payment} inside payment;
      * {@see resolve_payment_label_for_payload} as payment.paymentGateway (same as outgoing order paymentlabel).
      *
@@ -5813,10 +5845,7 @@ class OC_StoreOS_Integration {
         $payment_gateway = $this->resolve_payment_label_for_payload( $order, $options );
 
         if ( 'cardcom' === $profile ) {
-            $transaction_id = trim( (string) $order->get_meta( self::META_CARDCOM_PAYMENT_ID, true ) );
-            if ( '' === $transaction_id ) {
-                $transaction_id = trim( (string) $order->get_meta( self::META_CARDCOM_INTERNAL_DEAL_NUMBER, true ) );
-            }
+            $transaction_id = $this->resolve_cardcom_transaction_id_for_payload( $order );
 
             $capture_state = $this->get_cardcom_capture_state( $order );
 
