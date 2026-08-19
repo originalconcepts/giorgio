@@ -326,6 +326,27 @@ class OC_StoreOS_Integration {
         }
 
         if ( 'completed' === (string) $order->get_status() ) {
+            // Save/meta hooks run after the `completed` status is persisted but BEFORE the gateway's
+            // capture hook (`woocommerce_order_status_completed`, priority 10) has finished charging
+            // the J5 hold, so the capture flag still reads 'no' and the dispatch would report
+            // `failed: cardcom_capture_not_confirmed` for a charge that succeeds seconds later
+            // (zano-dagim order 43663: "failed" sent at 10:33:31, capture succeeded 10:33:33).
+            // A genuine capture failure is still reported: `woocommerce_order_status_changed`
+            // (priority 99) fires after the capture hook and dispatches with the persisted outcome.
+            if ( 'cardcom' === $this->resolve_storeos_payment_gateway_profile( $order )
+                && 'not_captured' === $this->get_cardcom_capture_state( $order ) ) {
+                $this->oc_storeos_wc_log(
+                    'info',
+                    sprintf(
+                        'OrderPayment v2: not dispatching from save/meta hook — Cardcom capture not confirmed yet (possibly mid-capture). Leaving the report to the status-transition hooks. order_id=%d source=%s',
+                        (int) $order_id,
+                        (string) $source
+                    ),
+                    array( 'order_id' => (int) $order_id )
+                );
+                return;
+            }
+
             $this->oc_storeos_wc_log(
                 'info',
                 sprintf(
