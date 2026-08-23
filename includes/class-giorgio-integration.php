@@ -211,6 +211,13 @@ class OC_StoreOS_Integration {
         // Cardcom מתחבר ל־woocommerce_order_status_completed בעדיפות 10; ריענון סכום ב־DB לפני כן (מתעלמים מתוסף Cardcom).
         add_action( 'woocommerce_order_status_completed', array( $this, 'maybe_refresh_order_totals_before_cardcom_capture' ), 5, 2 );
 
+        // Giorgio-owns-capture mode: the Cardcom gateway must never charge (Giorgio does, at picking).
+        // Unhook its capture callbacks once gateways exist; the priority-5 handlers above/below also
+        // unhook as a fallback right before the gateway's priority-10 callback would run.
+        add_action( 'wp_loaded', array( $this, 'maybe_unhook_cardcom_gateway_capture' ), 20 );
+        add_action( 'woocommerce_order_status_processing', array( $this, 'maybe_unhook_cardcom_gateway_capture' ), 5, 0 );
+        add_action( 'oc_storeos_giorgio_handover_backfill', array( $this, 'run_giorgio_handover_backfill' ), 10, 1 );
+
         // Make sure Giorgio-created orders have a nice, readable address
         // in the WooCommerce order screen preview, even when OC Woo Shipping
         // overrides the default formatting.
@@ -326,6 +333,12 @@ class OC_StoreOS_Integration {
         }
 
         if ( 'completed' === (string) $order->get_status() ) {
+            // Giorgio-owns-capture: Giorgio charged and pushed the paid state here; nothing to report back.
+            if ( self::GATEWAY_CARDCOM === (string) $order->get_payment_method()
+                && $this->giorgio_owns_cardcom_capture() ) {
+                return;
+            }
+
             // Save/meta hooks run after the `completed` status is persisted but BEFORE the gateway's
             // capture hook (`woocommerce_order_status_completed`, priority 10) has finished charging
             // the J5 hold, so the capture flag still reads 'no' and the dispatch would report
@@ -1180,6 +1193,16 @@ class OC_StoreOS_Integration {
             return null;
         }
 
+        // Giorgio-owns-capture: the gateway never captures, so its flag stays 'no' by design. The
+        // charge outcome arrives in the payload's `payment` block (apply_giorgio_payment_result_to_order)
+        // and must not be reported as "capture not confirmed".
+        if ( $this->giorgio_owns_cardcom_capture() ) {
+            return array(
+                'status'  => 'giorgio_owned',
+                'gateway' => self::GATEWAY_CARDCOM,
+            );
+        }
+
         // The gateway wrote the flag on its own order instance during the transition; re-read from the
         // database so we judge the capture on persisted state rather than on our pre-capture copy.
         wp_cache_delete( 'order-' . $order->get_id(), 'orders' );
@@ -1195,12 +1218,261 @@ class OC_StoreOS_Integration {
     }
 
     /**
+     * Payment result pushed by Giorgio for an order it charged itself (payload `payment` block with
+     * `captureOwner: "giorgio"`, see Giorgio backend WooCommerceService.BuildOcStoreosGiorgioPaymentBlock):
+     *   status: paid | refunded | partiallyRefunded | failed | authorized | unpaid
+     *   transactionId, invoiceNumber, documentUrl, paidAt, amount, refundedAmount, refundedAt,
+     *   refundInvoiceNumber, refundDocumentUrl, cardLast4, installments
+     *
+     * Applies the order-level fields (transaction id, paid date, Cardcom meta the rest of the
+     * ecosystem reads, one order note per state change). Never changes the order status — Giorgio
+     * sends that separately in `status`. Refund records are created after save
+     * ({@see apply_giorgio_refund_after_save}). Idempotent: the last applied state is kept in
+     * `_oc_storeos_giorgio_payment_state` and identical pushes are no-ops.
+     *
+     * @param WC_Order $order Order.
+     * @param array    $data  Incoming payload.
+     * @return bool True when a Giorgio payment block was present (and handled).
+     */
+    protected function apply_giorgio_payment_result_to_order( WC_Order $order, array $data ) {
+        $payment = isset( $data['payment'] ) && is_array( $data['payment'] ) ? $data['payment'] : null;
+        if ( null === $payment ) {
+            return false;
+        }
+        $owner = isset( $payment['captureOwner'] ) ? strtolower( trim( (string) $payment['captureOwner'] ) ) : '';
+        if ( 'giorgio' !== $owner ) {
+            return false;
+        }
+
+        $status         = isset( $payment['status'] ) ? sanitize_key( (string) $payment['status'] ) : '';
+        $transaction_id = isset( $payment['transactionId'] ) ? trim( (string) $payment['transactionId'] ) : '';
+        $invoice_no     = isset( $payment['invoiceNumber'] ) ? trim( (string) $payment['invoiceNumber'] ) : '';
+        $document_url   = isset( $payment['documentUrl'] ) ? esc_url_raw( (string) $payment['documentUrl'] ) : '';
+        $amount         = isset( $payment['amount'] ) && is_numeric( $payment['amount'] ) ? (float) $payment['amount'] : null;
+        $refunded       = isset( $payment['refundedAmount'] ) && is_numeric( $payment['refundedAmount'] ) ? (float) $payment['refundedAmount'] : 0.0;
+
+        $state_key = wp_json_encode( array( $status, $transaction_id, $invoice_no, round( $refunded, 2 ) ) );
+        $last_key  = (string) $order->get_meta( '_oc_storeos_giorgio_payment_state', true );
+        $changed   = ( $state_key !== $last_key );
+
+        $order->update_meta_data( '_oc_storeos_giorgio_capture_owner', 'giorgio' );
+
+        $is_paid_state = in_array( $status, array( 'paid', 'refunded', 'partiallyrefunded' ), true );
+
+        if ( $is_paid_state && '' !== $transaction_id ) {
+            // The gateway's own flag: once Giorgio charged, nothing on this site may capture again
+            // (belt and braces on top of the detached hooks).
+            $order->update_meta_data( self::META_CARDCOM_CHARGE_CAPTURED, 'yes' );
+            $order->update_meta_data( self::META_CARDCOM_PAYMENT_ID, $transaction_id );
+            $order->update_meta_data( self::META_CARDCOM_INTERNAL_DEAL_NUMBER, $transaction_id );
+            if ( (string) $order->get_transaction_id() !== $transaction_id ) {
+                $order->set_transaction_id( $transaction_id );
+            }
+            if ( ! $order->get_date_paid() ) {
+                $paid_at = isset( $payment['paidAt'] ) ? strtotime( (string) $payment['paidAt'] ) : false;
+                $order->set_date_paid( $paid_at ? $paid_at : time() );
+            }
+            if ( '' !== $invoice_no ) {
+                $order->update_meta_data( 'initial_document_no', $invoice_no );
+                $order->update_meta_data( '_oc_storeos_giorgio_invoice_number', $invoice_no );
+            }
+            if ( '' !== $document_url ) {
+                $order->update_meta_data( '_oc_storeos_giorgio_invoice_url', $document_url );
+            }
+        }
+
+        if ( $changed ) {
+            $order->update_meta_data( '_oc_storeos_giorgio_payment_state', $state_key );
+            $note = '';
+            switch ( $status ) {
+                case 'paid':
+                    $note = sprintf(
+                        /* translators: 1: amount, 2: transaction id, 3: invoice number */
+                        __( 'Giorgio: החיוב בקארדקום בוצע — %1$s, עסקה %2$s%3$s', 'oc-storeos-integration' ),
+                        null !== $amount ? wc_price( $amount ) : '',
+                        $transaction_id,
+                        '' !== $invoice_no ? sprintf( __( ', חשבונית %s', 'oc-storeos-integration' ), $invoice_no ) : ''
+                    );
+                    break;
+                case 'failed':
+                    $note = __( 'Giorgio: החיוב בקארדקום נכשל — יש להשלים תשלום מתוך Giorgio.', 'oc-storeos-integration' );
+                    break;
+                case 'refunded':
+                case 'partiallyrefunded':
+                    $note = sprintf(
+                        /* translators: 1: refunded amount */
+                        __( 'Giorgio: בוצע זיכוי בקארדקום — %s', 'oc-storeos-integration' ),
+                        wc_price( $refunded )
+                    );
+                    break;
+            }
+            if ( '' !== $note ) {
+                $order->add_order_note( wp_strip_all_tags( $note ), false, false );
+            }
+            $this->oc_storeos_wc_log(
+                'info',
+                sprintf(
+                    'Giorgio payment result applied. order_id=%d status=%s txn=%s invoice=%s refunded=%s',
+                    (int) $order->get_id(),
+                    $status,
+                    $transaction_id,
+                    $invoice_no,
+                    (string) $refunded
+                ),
+                array( 'order_id' => (int) $order->get_id() )
+            );
+        }
+
+        return true;
+    }
+
+    /**
+     * Mirror a Giorgio refund as a WooCommerce refund record (no gateway call — the money already
+     * moved at Cardcom). Creates one refund for the difference between Giorgio's refundedAmount and
+     * what this order already has refunded, so repeated pushes never double-book.
+     *
+     * @param WC_Order $order Saved order.
+     * @param array    $data  Incoming payload.
+     */
+    protected function apply_giorgio_refund_after_save( WC_Order $order, array $data ) {
+        $payment  = isset( $data['payment'] ) && is_array( $data['payment'] ) ? $data['payment'] : array();
+        $refunded = isset( $payment['refundedAmount'] ) && is_numeric( $payment['refundedAmount'] ) ? round( (float) $payment['refundedAmount'], 2 ) : 0.0;
+        if ( $refunded <= 0 ) {
+            return;
+        }
+        $already = round( (float) $order->get_total_refunded(), 2 );
+        $diff    = round( $refunded - $already, 2 );
+        if ( $diff < 0.01 ) {
+            return;
+        }
+        $reason = isset( $payment['refundInvoiceNumber'] ) && '' !== trim( (string) $payment['refundInvoiceNumber'] )
+            ? sprintf( __( 'זיכוי מ־Giorgio (חשבונית זיכוי %s)', 'oc-storeos-integration' ), trim( (string) $payment['refundInvoiceNumber'] ) )
+            : __( 'זיכוי מ־Giorgio', 'oc-storeos-integration' );
+        $refund = wc_create_refund(
+            array(
+                'amount'         => $diff,
+                'reason'         => $reason,
+                'order_id'       => $order->get_id(),
+                'refund_payment' => false,
+                'restock_items'  => false,
+            )
+        );
+        if ( is_wp_error( $refund ) ) {
+            $this->oc_storeos_wc_log(
+                'error',
+                sprintf( 'Giorgio refund mirror failed. order_id=%d amount=%s error=%s', (int) $order->get_id(), (string) $diff, $refund->get_error_message() ),
+                array( 'order_id' => (int) $order->get_id() )
+            );
+            return;
+        }
+        $this->oc_storeos_wc_log(
+            'info',
+            sprintf( 'Giorgio refund mirrored. order_id=%d amount=%s total_refunded=%s', (int) $order->get_id(), (string) $diff, (string) $refunded ),
+            array( 'order_id' => (int) $order->get_id() )
+        );
+    }
+
+    /**
+     * One-time handover for orders that existed BEFORE the option was switched on: every open Cardcom
+     * order (hold placed, never captured, not cancelled/refunded) re-sends its OrderPayment v2 — which
+     * now carries the token — so Giorgio takes ownership of those orders as well. Without this, the
+     * detached gateway hooks would leave them with nobody to charge. Batches of 25 via WP-Cron,
+     * newest first, 60 days back; orders the gateway already captured are skipped.
+     *
+     * @param int $page 1-based batch index.
+     */
+    public function run_giorgio_handover_backfill( $page = 1 ) {
+        if ( ! $this->giorgio_owns_cardcom_capture() || ! function_exists( 'wc_get_orders' ) ) {
+            return;
+        }
+        $page  = max( 1, (int) $page );
+        $limit = 25;
+
+        $orders = wc_get_orders(
+            array(
+                'limit'          => $limit,
+                'page'           => $page,
+                'orderby'        => 'ID',
+                'order'          => 'DESC',
+                'payment_method' => self::GATEWAY_CARDCOM,
+                'status'         => array( 'pending', 'on-hold', 'processing', 'completed' ),
+                'date_created'   => '>' . ( time() - 60 * DAY_IN_SECONDS ),
+                'return'         => 'objects',
+            )
+        );
+
+        $sent = 0;
+        foreach ( (array) $orders as $order ) {
+            if ( ! $order instanceof WC_Order ) {
+                continue;
+            }
+            if ( 'captured' === $this->get_cardcom_capture_state( $order ) ) {
+                continue; // Already charged by the gateway — Giorgio knows it from the old flow.
+            }
+            if ( '' === $this->get_newest_order_meta_value( $order, 'cardcom_token_val' ) ) {
+                continue; // Nothing to hand over.
+            }
+            $this->maybe_send_order_payment_webhook_v2( $order );
+            $sent++;
+        }
+
+        $this->oc_storeos_wc_log(
+            'info',
+            sprintf( 'Giorgio handover backfill: page=%d orders=%d sent=%d', $page, count( (array) $orders ), $sent ),
+            array()
+        );
+
+        if ( count( (array) $orders ) === $limit ) {
+            wp_schedule_single_event( time() + 30, 'oc_storeos_giorgio_handover_backfill', array( $page + 1 ) );
+        }
+    }
+
+    /**
+     * Giorgio-owns-capture mode: detach the Cardcom gateway's capture callbacks
+     * (`cardcom_on_order_status_completed` / `cardcom_on_order_status_processing`, both priority 10 —
+     * woo-cardcom-payment-gateway/cardcom.php:202-203) so a status change never charges the token.
+     * Giorgio charges at picking and reports back via the `payment` block of the incoming order
+     * payload (see apply_giorgio_payment_result_to_order). Idempotent; no-op when the option is off
+     * or the gateway is not loaded.
+     */
+    public function maybe_unhook_cardcom_gateway_capture() {
+        static $done = false;
+        if ( $done || ! $this->giorgio_owns_cardcom_capture() ) {
+            return;
+        }
+        if ( ! function_exists( 'WC' ) || ! WC()->payment_gateways ) {
+            return;
+        }
+        $gateways = WC()->payment_gateways->payment_gateways();
+        if ( ! is_array( $gateways ) ) {
+            return;
+        }
+        foreach ( $gateways as $gateway ) {
+            if ( ! is_object( $gateway ) || self::GATEWAY_CARDCOM !== (string) $gateway->id ) {
+                continue;
+            }
+            $removed_completed  = remove_action( 'woocommerce_order_status_completed', array( $gateway, 'cardcom_on_order_status_completed' ), 10 );
+            $removed_processing = remove_action( 'woocommerce_order_status_processing', array( $gateway, 'cardcom_on_order_status_processing' ), 10 );
+            $done = true;
+            $this->maybe_debug_log( sprintf(
+                '[OC Giorgio] Giorgio-owns-capture: Cardcom gateway capture hooks detached (completed=%s, processing=%s).',
+                $removed_completed ? 'yes' : 'not-found',
+                $removed_processing ? 'yes' : 'not-found'
+            ) );
+            return;
+        }
+    }
+
+    /**
      * לפני חיוב טוקן Cardcom (priority 10): מאלץ calculate_totals + save כדי ש־initTerminal עם wc_get_order יראה סכום מעודכן.
      *
      * @param int               $order_id Order ID.
      * @param WC_Order|mixed    $order    Order instance.
      */
     public function maybe_refresh_order_totals_before_cardcom_capture( $order_id, $order ) {
+        // Fallback unhook: runs at priority 5, before the gateway's priority-10 capture on this very hook.
+        $this->maybe_unhook_cardcom_gateway_capture();
+
         if ( ! apply_filters( 'oc_storeos_refresh_order_totals_before_cardcom_capture', true, $order_id, $order ) ) {
             return;
         }
@@ -1554,12 +1826,19 @@ class OC_StoreOS_Integration {
             // שיטת תשלום מ־Giorgio (חובה לפלאקארד/קארדקום לפני מעבר ל־completed): paymentMethod | paymentMethodId | wcPaymentMethod
             $this->apply_payment_method_from_storeos_payload( $order, $data );
 
+            // תוצאת תשלום מ־Giorgio (כשהחיוב מתבצע שם): שולם / נכשל / זוכה — לפני שינוי הסטטוס והשמירה.
+            $giorgio_payment_applied = $this->apply_giorgio_payment_result_to_order( $order, $data );
+
             if ( $updating_existing && null !== $deferred_wc_status && '' !== $deferred_wc_status ) {
                 $order->set_status( $deferred_wc_status );
             }
 
             $order->calculate_totals();
             $order->save(); // כאן הכל נשמר ב-Database בפעם אחת
+
+            if ( $giorgio_payment_applied ) {
+                $this->apply_giorgio_refund_after_save( $order, $data );
+            }
 
             // חיוב מסגרת של Cardcom רץ בתוך המעבר ל-completed, כלומר בתוך ה-save שלמעלה.
             // כישלון שלו הוא הערת הזמנה בלבד — בלי הבדיקה הזו הבקשה חוזרת 200/success ו-Giorgio רושם "חויב".
@@ -2254,6 +2533,14 @@ class OC_StoreOS_Integration {
         );
 
         add_settings_field(
+            'giorgio_owns_cardcom_capture',
+            __( 'חיוב קארדקום מתבצע ב־Giorgio', 'oc-storeos-integration' ),
+            array( $this, 'render_field_giorgio_owns_cardcom_capture' ),
+            'oc-giorgio-orders',
+            'oc_giorgio_orders'
+        );
+
+        add_settings_field(
             'include_variation_in_line_title',
             __( 'הוסף שם הוריאציה לכותרת (בשליחה ל־Giorgio)', 'oc-storeos-integration' ),
             array( $this, 'render_field_include_variation_in_line_title' ),
@@ -2359,6 +2646,16 @@ class OC_StoreOS_Integration {
 
         $options['send_order_payment_webhook_on_charge'] = isset( $input['send_order_payment_webhook_on_charge'] )
             && ( '1' === (string) $input['send_order_payment_webhook_on_charge'] );
+
+        $giorgio_was_on = ! empty( $options['giorgio_owns_cardcom_capture'] );
+        $options['giorgio_owns_cardcom_capture'] = isset( $input['giorgio_owns_cardcom_capture'] )
+            && ( '1' === (string) $input['giorgio_owns_cardcom_capture'] );
+        // Switched on: orders that already hold a Cardcom token must reach Giorgio too — the gateway
+        // stops capturing for ALL orders the moment the option is on, so every open Cardcom order
+        // needs its token handed over (see run_giorgio_handover_backfill).
+        if ( $options['giorgio_owns_cardcom_capture'] && ! $giorgio_was_on ) {
+            wp_schedule_single_event( time() + 10, 'oc_storeos_giorgio_handover_backfill', array( 1 ) );
+        }
 
         if ( isset( $input['order_total_fee_percent'] ) ) {
             $raw = is_string( $input['order_total_fee_percent'] ) || is_numeric( $input['order_total_fee_percent'] )
@@ -2514,6 +2811,7 @@ class OC_StoreOS_Integration {
             'debug_email_recipient' => '',
             'send_order_to_storeos_status' => 'processing',
             'send_order_payment_webhook_on_charge' => true,
+            'giorgio_owns_cardcom_capture' => false,
             'order_total_fee_percent' => 0,
             'order_total_fee_cart_text' => '',
             'order_total_fee_tooltip' => 'תוספת זו מוסיפה Fee באחוז מסכום ההזמנה (למשל שינויי משקל בפועל מול מה שהלקוח סימן).',
@@ -2910,6 +3208,36 @@ class OC_StoreOS_Integration {
             <?php esc_html_e( 'בחירת סטטוס ברירת מחדל: ההזמנה תישלח ל־Giorgio בפעם הראשונה שההזמנה עוברת לסטטוס הזה (בהתאם לשיטת התשלום — ר׳ הטבלה ״מיפוי שיטות תשלום״, עמודת סטטוס). אם לשיטה אין עקיפה בטבלה, משתמשים בערך כאן. לא נשלח מיד ביצירת ההזמנה. עדכון תשלום (OrderPayment) נשאר בהגדרה נפרדת למטה.', 'oc-storeos-integration' ); ?>
         </p>
         <?php
+    }
+
+    /**
+     * Render checkbox: Giorgio charges the Cardcom token itself (the gateway plugin only places the
+     * checkout hold). See giorgio_owns_cardcom_capture().
+     */
+    public function render_field_giorgio_owns_cardcom_capture() {
+        $options = $this->get_options();
+        $on      = ! empty( $options['giorgio_owns_cardcom_capture'] );
+        $name    = self::OPTION_NAME . '[giorgio_owns_cardcom_capture]';
+        ?>
+        <input type="hidden" name="<?php echo esc_attr( $name ); ?>" value="0" />
+        <label>
+            <input type="checkbox" class="oc-toggle" name="<?php echo esc_attr( $name ); ?>" value="1" <?php checked( $on ); ?> />
+            <?php esc_html_e( 'תוסף קארדקום רק תופס מסגרת בצ׳קאאוט; הטוקן נשלח ל־Giorgio, ו־Giorgio מבצע את החיוב בסיום הליקוט ומעדכן את ההזמנה כאן.', 'oc-storeos-integration' ); ?>
+        </label>
+        <p class="description">
+            <?php esc_html_e( 'כשדולק: תוסף קארדקום לא יחייב בשינוי סטטוס ל״הושלמה״/״בטיפול״ (מניעת חיוב כפול), ולא יישלח עדכון תשלום (OrderPayment) על תפיסה — Giorgio הוא מקור האמת לתשלום. חל על הזמנות שנוצרו אחרי ההפעלה.', 'oc-storeos-integration' ); ?>
+        </p>
+        <?php
+    }
+
+    /**
+     * True when Giorgio charges Cardcom tokens for this store (option giorgio_owns_cardcom_capture).
+     *
+     * @return bool
+     */
+    public function giorgio_owns_cardcom_capture() {
+        $options = $this->get_options();
+        return ! empty( $options['giorgio_owns_cardcom_capture'] );
     }
 
     /**
@@ -4505,10 +4833,10 @@ class OC_StoreOS_Integration {
      * promotions, null for promotions authored locally in WooCommerce.
      *
      * Per-line breakdown (`lines[]`): derived from what WooCommerce actually charged — each order line's
-     * `subtotal` (pre-discount) minus `total` (charged). This is the source of truth for George's per-line
+     * `subtotal` (pre-discount) minus `total` (charged). This is the source of truth for Giorgio's per-line
      * stamping. Because the Promotion Engine aggregates line discounts across promotions (it does not tag
      * each discounted line with the owning promotion), we only attach `lines[]` when a single promotion is
-     * applied; for multiple promotions we send the order-level `discountAmount` only and let George
+     * applied; for multiple promotions we send the order-level `discountAmount` only and let Giorgio
      * distribute it (which it does as a fallback). The order-level `discountAmount` stays the engine's
      * reported `saved` so existing behaviour is unchanged.
      *
@@ -4534,7 +4862,7 @@ class OC_StoreOS_Integration {
             }
             $product = $item->get_product();
             $order_line_discounts[] = array(
-                'productId'        => (int) $item->get_product_id(), // parent product id — matches George WooCommerceProductId
+                'productId'        => (int) $item->get_product_id(), // parent product id — matches Giorgio WooCommerceProductId
                 'sku'              => $product instanceof WC_Product ? (string) $product->get_sku() : '',
                 'quantityAffected' => (float) $item->get_quantity(),
                 'discountAmount'   => $discount,
@@ -4883,6 +5211,9 @@ class OC_StoreOS_Integration {
             'approvalNumber'    => null,
         );
 
+        // Giorgio-owns-capture: hand the checkout token over so Giorgio charges at picking.
+        $payment_block = array_merge( $payment_block, $this->get_giorgio_capture_handover_fields( $order ) );
+
         // Remove nulls while keeping insertion order for existing keys.
         foreach ( $payment_block as $k => $v ) {
             if ( null === $v ) {
@@ -4946,6 +5277,81 @@ class OC_StoreOS_Integration {
         }
 
         return (array) apply_filters( 'oc_storeos_cardcom_outgoing_order_fields', $fields, $order );
+    }
+
+    /**
+     * Giorgio-owns-capture handover for the `payment` block (outgoing order + OrderPayment v2).
+     *
+     * The Cardcom gateway writes these at checkout with add_meta_data — a second payment attempt
+     * APPENDS rows, and get_meta() answers with the OLDEST one (the declined card's token), so every
+     * value is read as the newest DB row ({@see get_order_meta_values_uncached}). Keys are the
+     * gateway's own (woo-cardcom-payment-gateway/cardcom.php:2262-2277):
+     *   cardcom_token_val (token UUID), cardcom_Tokef (MMYY), cardcom_Approval_Num (J5 approval),
+     *   cardcom_NumOfPayments (installments the customer chose).
+     *
+     * @param WC_Order $order Order.
+     * @return array Empty unless the option is on, the order is a Cardcom order and a token exists.
+     */
+    protected function get_giorgio_capture_handover_fields( WC_Order $order ) {
+        if ( ! $this->giorgio_owns_cardcom_capture() ) {
+            return array();
+        }
+        if ( self::GATEWAY_CARDCOM !== (string) $order->get_payment_method() ) {
+            return array();
+        }
+
+        $token = $this->get_newest_order_meta_value( $order, 'cardcom_token_val' );
+        if ( '' === $token ) {
+            return array();
+        }
+
+        $fields = array(
+            'captureOwner' => 'giorgio',
+            'token'        => $token,
+        );
+
+        $tokef = $this->get_newest_order_meta_value( $order, 'cardcom_Tokef' );
+        if ( '' === $tokef ) {
+            $mo = $this->get_newest_order_meta_value( $order, self::META_CARDCOM_TOKEN_EXPIRY_MONTH );
+            $yr = $this->get_newest_order_meta_value( $order, self::META_CARDCOM_TOKEN_EXPIRY_YEAR );
+            if ( '' !== $mo && '' !== $yr ) {
+                $tokef = str_pad( $mo, 2, '0', STR_PAD_LEFT ) . substr( $yr, -2 );
+            }
+        }
+        if ( '' !== $tokef ) {
+            $fields['tokenExpiry'] = $tokef;
+        }
+
+        $approval = $this->get_newest_order_meta_value( $order, 'cardcom_Approval_Num' );
+        if ( '' !== $approval && '0' !== $approval ) {
+            $fields['approvalNumber'] = $approval;
+        }
+
+        $payments = $this->get_newest_order_meta_value( $order, self::META_CARDCOM_NUM_OF_PAYMENTS );
+        if ( is_numeric( $payments ) && (int) $payments > 1 ) {
+            $fields['numOfPayments'] = (int) $payments;
+        }
+
+        return (array) apply_filters( 'oc_storeos_giorgio_capture_handover_fields', $fields, $order );
+    }
+
+    /**
+     * Newest stored value of an order meta key (uncached DB read, see get_order_meta_values_uncached),
+     * falling back to the in-memory instance when nothing is persisted yet.
+     *
+     * @param WC_Order $order    Order.
+     * @param string   $meta_key Meta key.
+     * @return string Trimmed value or ''.
+     */
+    protected function get_newest_order_meta_value( WC_Order $order, $meta_key ) {
+        $values = $this->get_order_meta_values_uncached( $order->get_id(), $meta_key );
+        if ( ! empty( $values ) ) {
+            $newest = trim( (string) end( $values ) );
+            if ( '' !== $newest ) {
+                return $newest;
+            }
+        }
+        return trim( (string) $order->get_meta( $meta_key, true ) );
     }
 
     /**
@@ -5593,6 +5999,20 @@ class OC_StoreOS_Integration {
             $order = wc_get_order( $order_id );
         }
 
+        // Giorgio-owns-capture: "completed" is pushed by Giorgio itself after it charged; echoing a
+        // payment report back would only add a stale hold event on its side. The hold (with the token)
+        // already went out with the order / on payment_complete.
+        if ( $order instanceof WC_Order
+            && self::GATEWAY_CARDCOM === (string) $order->get_payment_method()
+            && $this->giorgio_owns_cardcom_capture() ) {
+            $this->oc_storeos_wc_log(
+                'info',
+                sprintf( 'OrderPayment v2: skipped on completed — Giorgio owns Cardcom capture. order_id=%d', (int) $order_id ),
+                array( 'order_id' => (int) $order_id )
+            );
+            return;
+        }
+
         $this->oc_storeos_wc_log(
             'info',
             sprintf(
@@ -5869,6 +6289,35 @@ class OC_StoreOS_Integration {
             $transaction_id = $this->resolve_cardcom_transaction_id_for_payload( $order );
 
             $capture_state = $this->get_cardcom_capture_state( $order );
+
+            // Giorgio-owns-capture: the gateway never captures here, so `not_captured` is the normal,
+            // permanent state of a live hold — not a failed charge. Report the hold (with the token
+            // handover) and never claim a final charge; Giorgio charges and pushes the result back.
+            if ( $this->giorgio_owns_cardcom_capture() ) {
+                $handover = $this->get_giorgio_capture_handover_fields( $order );
+                $payload  = array(
+                    'orderId' => (int) $order->get_id(),
+                    'status'  => ( '' !== $transaction_id ) ? 'success' : 'failed',
+                );
+                $payment_block = array_merge(
+                    array(
+                        'transactionId'    => '' !== $transaction_id ? $transaction_id : null,
+                        'paymentGateway'   => 'cardcom',
+                        'authorizedAmount' => (float) $order->get_total(),
+                    ),
+                    $handover
+                );
+                foreach ( $payment_block as $k => $v ) {
+                    if ( null === $v ) {
+                        unset( $payment_block[ $k ] );
+                    }
+                }
+                $payload['payment']              = $payment_block;
+                $payload['gatewayPaymentStatus'] = 'authorized';
+                $payload['gatewayIsFinished']    = 'false';
+                $payload['isFinished']           = 'false';
+                return $this->apply_order_payment_webhook_v2_common_fields( $order, $payload );
+            }
 
             if ( 'not_captured' === $capture_state ) {
                 // Hold placed, charge did not go through. Never report this as paid.
