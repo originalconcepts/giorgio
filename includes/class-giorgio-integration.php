@@ -1644,6 +1644,28 @@ class OC_StoreOS_Integration {
                 foreach ( $order->get_items() as $item_id => $item ) {
                     $order->remove_item( $item_id );
                 }
+                // ננקה גם שורות Fee שליליות (הנחות, למשל "5% הנחת לקוח מועדון"): Giorgio מחזיר את
+                // מחירי השורות כשההנחה כבר מגולמת בהם (orderTotal מפוזר על הפריטים), ולכן השארת
+                // ה-Fee המקורי מהצ'קאאוט מחילה את ההנחה פעמיים ומקטינה את סכום ההזמנה ב-Woo.
+                // Fee חיובי (למשל תוספת משקל) נשאר כמו שהוא.
+                $removed_discount_fees = array();
+                foreach ( $order->get_items( 'fee' ) as $fee_id => $fee_item ) {
+                    if ( (float) $fee_item->get_total() < 0 ) {
+                        $removed_discount_fees[] = sprintf( '%s (%s)', $fee_item->get_name(), $fee_item->get_total() );
+                        $order->remove_item( $fee_id );
+                    }
+                }
+                if ( ! empty( $removed_discount_fees ) ) {
+                    $this->oc_storeos_wc_log(
+                        'info',
+                        sprintf(
+                            'Incoming REST rebuild: removed stale discount fee line(s) on order %d (already included in Giorgio line prices): %s',
+                            (int) $order->get_id(),
+                            implode( ', ', $removed_discount_fees )
+                        ),
+                        array( 'order_id' => (int) $order->get_id() )
+                    );
+                }
                 // משלוח: בעדכון הזמנה קיימת לא מסירים שורות משלוח — סנכרון Giorgio לא יכול להשאיר הזמנה בלי שיטת משלוח.
             }
 
