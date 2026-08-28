@@ -14,8 +14,15 @@ class OC_StoreOS_Integration {
     /** Hash of the last OrderPayment v2 payload Giorgio accepted — cross-request duplicate guard. */
     const META_PAYMENT_WEBHOOK_V2_HASH = '_oc_storeos_payment_webhook_v2_hash';
 
-    /** @var string Uploads-relative directory for REST incoming log. */
-    const REST_INCOMING_LOG_DIR = 'giorgio';
+    /**
+     * Uploads-relative directory for the REST logs. Dot-prefixed on purpose: these servers serve
+     * wp-content/uploads as static files, so the previous 'giorgio' directory handed the logs —
+     * customer names, phones, addresses, order contents, Cardcom deal numbers and, in
+     * Giorgio-owns-capture mode, the card token — to anyone who guessed the URL. A dot-named
+     * directory is refused by the web server, so the files stay readable to the site and to
+     * support tooling but not to the public.
+     */
+    const REST_INCOMING_LOG_DIR = '.giorgio';
 
     /** @var string Log file name (under REST_INCOMING_LOG_DIR or WP_CONTENT_DIR fallback). */
     const REST_INCOMING_LOG_FILE = 'incoming-rest-orders.log';
@@ -1721,6 +1728,28 @@ class OC_StoreOS_Integration {
                 foreach ( $order->get_items() as $item_id => $item ) {
                     $order->remove_item( $item_id );
                 }
+                // ננקה גם שורות Fee שליליות (הנחות, למשל "5% הנחת לקוח מועדון"): Giorgio מחזיר את
+                // מחירי השורות כשההנחה כבר מגולמת בהם (orderTotal מפוזר על הפריטים), ולכן השארת
+                // ה-Fee המקורי מהצ'קאאוט מחילה את ההנחה פעמיים ומקטינה את סכום ההזמנה ב-Woo.
+                // Fee חיובי (למשל תוספת משקל) נשאר כמו שהוא.
+                $removed_discount_fees = array();
+                foreach ( $order->get_items( 'fee' ) as $fee_id => $fee_item ) {
+                    if ( (float) $fee_item->get_total() < 0 ) {
+                        $removed_discount_fees[] = sprintf( '%s (%s)', $fee_item->get_name(), $fee_item->get_total() );
+                        $order->remove_item( $fee_id );
+                    }
+                }
+                if ( ! empty( $removed_discount_fees ) ) {
+                    $this->oc_storeos_wc_log(
+                        'info',
+                        sprintf(
+                            'Incoming REST rebuild: removed stale discount fee line(s) on order %d (already included in Giorgio line prices): %s',
+                            (int) $order->get_id(),
+                            implode( ', ', $removed_discount_fees )
+                        ),
+                        array( 'order_id' => (int) $order->get_id() )
+                    );
+                }
                 // משלוח: בעדכון הזמנה קיימת לא מסירים שורות משלוח — סנכרון Giorgio לא יכול להשאיר הזמנה בלי שיטת משלוח.
             }
 
@@ -2321,11 +2350,40 @@ class OC_StoreOS_Integration {
         if ( ! $path ) {
             return;
         }
-        $line = wp_json_encode( $fields, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES );
+        $line = wp_json_encode( $this->redact_secrets_for_log( $fields ), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES );
         if ( false === $line ) {
             $line = '{"time_utc":"' . gmdate( 'c' ) . '","result":"log_encode_error"}';
         }
         @file_put_contents( $path, $line . "\n", FILE_APPEND | LOCK_EX );
+    }
+
+    /**
+     * Mask payment secrets anywhere in a log record before it is written to disk.
+     *
+     * In Giorgio-owns-capture mode the outgoing payload carries the Cardcom token, and a token plus
+     * its expiry is enough to charge the customer. A log file is the wrong place for that even when
+     * the directory is not public, so the value never reaches the disk in readable form.
+     *
+     * @param mixed $value Record, or any nested part of one.
+     * @return mixed Same shape, with secret values replaced.
+     */
+    protected function redact_secrets_for_log( $value ) {
+        if ( ! is_array( $value ) ) {
+            return $value;
+        }
+
+        $secret_keys = array( 'token', 'CardcomToken', 'cardcom_token_val', 'api_token', 'github_token' );
+
+        $out = array();
+        foreach ( $value as $key => $item ) {
+            if ( is_string( $key ) && in_array( $key, $secret_keys, true ) && ! is_array( $item ) ) {
+                $out[ $key ] = ( '' === (string) $item ) ? '' : '***redacted***';
+                continue;
+            }
+            $out[ $key ] = is_array( $item ) ? $this->redact_secrets_for_log( $item ) : $item;
+        }
+
+        return $out;
     }
 
     /**
@@ -2338,7 +2396,7 @@ class OC_StoreOS_Integration {
         if ( ! $path ) {
             return;
         }
-        $line = wp_json_encode( $fields, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES );
+        $line = wp_json_encode( $this->redact_secrets_for_log( $fields ), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES );
         if ( false === $line ) {
             $line = '{"time_utc":"' . gmdate( 'c' ) . '","result":"log_encode_error"}';
         }
