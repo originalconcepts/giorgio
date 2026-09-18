@@ -1098,6 +1098,326 @@ class OC_StoreOS_Integration {
     }
 
     /**
+     * מארזים (OC Bundles) בעדכון הזמנה קיימת מ-Giorgio (BUNDLES_SYNC_SPEC §6): שורות מארז קיימות
+     * ש-Giorgio מחזיר עם bundle.itemId תואם (וכמות > 0) מתעדכנות במקום (oc_bundles_update_order_line)
+     * ולא נמחקות בבנייה ההורסת. שורות הפיצול שלהן (_oc_bundle_component_of) אינן נשמרות — הן נמחקות
+     * עם שאר הפריטים והעדכון מפצל מחדש. כש-OC Bundles לא פעיל מחזיר ריק (התנהגות קודמת: הכל נמחק).
+     *
+     * @param WC_Order $order ההזמנה הקיימת (לפני הסרת הפריטים).
+     * @param array    $data  גוף הבקשה.
+     * @return array item id => WC_Order_Item_Product — שורות מארז שיש להשאיר ולעדכן.
+     */
+    protected function collect_storeos_rest_bundle_lines_to_update( WC_Order $order, array $data ) {
+        if (
+            ! function_exists( 'oc_bundles_is_bundle_order_item' )
+            || ! function_exists( 'oc_bundles_update_order_line' )
+            || empty( $data['items'] )
+            || ! is_array( $data['items'] )
+        ) {
+            return array();
+        }
+
+        $incoming_item_ids = array();
+        foreach ( $data['items'] as $payload_item ) {
+            if ( ! is_array( $payload_item ) || empty( $payload_item['bundle'] ) || ! is_array( $payload_item['bundle'] ) ) {
+                continue;
+            }
+            $quantity = isset( $payload_item['quantity'] ) ? (float) $payload_item['quantity'] : 0;
+            if ( $quantity <= 0 ) {
+                continue; // כמות 0 = השורה הוסרה ב-Giorgio → נמחקת כמו כל פריט.
+            }
+            $bundle_item_id = ( isset( $payload_item['bundle']['itemId'] ) && is_numeric( $payload_item['bundle']['itemId'] ) ) ? (int) $payload_item['bundle']['itemId'] : 0;
+            if ( $bundle_item_id > 0 ) {
+                $incoming_item_ids[ $bundle_item_id ] = true;
+            }
+        }
+        if ( empty( $incoming_item_ids ) ) {
+            return array();
+        }
+
+        $bundle_lines = array();
+        $split_lines  = array();
+        foreach ( $order->get_items() as $item_id => $item ) {
+            if ( ! $item instanceof WC_Order_Item_Product ) {
+                continue;
+            }
+            if ( function_exists( 'oc_bundles_is_component_line' ) && oc_bundles_is_component_line( $item ) ) {
+                $split_lines[] = (int) $item_id;
+                continue;
+            }
+            if ( isset( $incoming_item_ids[ (int) $item_id ] ) && oc_bundles_is_bundle_order_item( $item ) ) {
+                $bundle_lines[ (int) $item_id ] = $item;
+            }
+        }
+
+        if ( ! empty( $bundle_lines ) ) {
+            $this->oc_storeos_wc_log(
+                'info',
+                sprintf(
+                    'Incoming REST rebuild: keeping %d bundle line(s) on order %d for in-place update (item ids: %s); %d split component line(s) removed (re-split by OC Bundles).',
+                    count( $bundle_lines ),
+                    (int) $order->get_id(),
+                    implode( ',', array_keys( $bundle_lines ) ),
+                    count( $split_lines )
+                ),
+                array( 'order_id' => (int) $order->get_id() )
+            );
+        }
+
+        return $bundle_lines;
+    }
+
+    /**
+     * שורת מארז (OC Bundles) מ-payload נכנס (BUNDLES_SYNC_SPEC §6): עדכון במקום כש-bundle.itemId תואם
+     * שורה שנשמרה ב-collect_storeos_rest_bundle_lines_to_update, אחרת יצירה דרך oc_bundles_add_order_line
+     * (מוצר המארז לפי bundle.wooProductId, אחר כך sku / productId).
+     *
+     * @param WC_Order $order                 ההזמנה.
+     * @param array    $payload_item          איבר מתוך `items`.
+     * @param float    $quantity              כמות מארזים (>0).
+     * @param array    $existing_bundle_lines item id => שורת מארז קיימת (השורה מוסרת מהמערך אחרי עדכון).
+     * @return bool|null true = נוספה/עודכנה; null = לא טופל כאן (לא מארז / OC Bundles לא פעיל / כשל) — הנתיב הרגיל ממשיך.
+     */
+    protected function handle_storeos_rest_bundle_line_from_payload( WC_Order $order, array $payload_item, $quantity, array &$existing_bundle_lines ) {
+        if ( empty( $payload_item['bundle'] ) || ! is_array( $payload_item['bundle'] ) ) {
+            return null;
+        }
+        if ( ! function_exists( 'oc_bundles_add_order_line' ) || ! function_exists( 'oc_bundles_update_order_line' ) ) {
+            return null; // OC Bundles לא פעיל — השורה נוספת כמוצר רגיל (התנהגות קודמת).
+        }
+
+        $bundle         = $payload_item['bundle'];
+        $order_id       = (int) $order->get_id();
+        $bundle_item_id = ( isset( $bundle['itemId'] ) && is_numeric( $bundle['itemId'] ) ) ? (int) $bundle['itemId'] : 0;
+
+        // א. עדכון במקום של שורת מארז קיימת.
+        if ( $bundle_item_id > 0 && isset( $existing_bundle_lines[ $bundle_item_id ] ) ) {
+            $line = $existing_bundle_lines[ $bundle_item_id ];
+            unset( $existing_bundle_lines[ $bundle_item_id ] ); // כל שורה מתעדכנת פעם אחת.
+
+            $spec = $this->build_oc_bundles_spec_from_payload( $order, $line->get_product(), $quantity, $payload_item );
+
+            if ( abs( (float) $line->get_quantity() - (float) $quantity ) > 0.0001 ) {
+                $line->set_quantity( $quantity );
+            }
+
+            // ההזמנה החיה עוברת כארגומנט שלישי כדי ששורות הפיצול המחודש ינחתו על אותו אובייקט בזיכרון
+            // (בלי טעינה/שמירה נפרדת בתוך OC Bundles) — calculate_totals() כאן רואה אותן.
+            $result = oc_bundles_update_order_line( $line, $spec, $order );
+            if ( is_wp_error( $result ) ) {
+                $this->oc_storeos_wc_log(
+                    'warning',
+                    sprintf(
+                        'Incoming REST: oc_bundles_update_order_line failed on order %d item %d (%s: %s); line removed and re-added through the regular product path.',
+                        $order_id,
+                        $bundle_item_id,
+                        $result->get_error_code(),
+                        $result->get_error_message()
+                    ),
+                    array( 'order_id' => $order_id )
+                );
+                // השורה הישנה יוצאת והנתיב הרגיל מוסיף את הפריט כמוצר רגיל — הכסף נשמר בהזמנה.
+                // לפני ההסרה מחזירים למלאי את מה שהשורה לקחה מהרכיבים (OC Bundles מנהל מלאי רכיבים
+                // בעצמו; ה-hooks של WooCommerce לא רואים אותם).
+                if ( function_exists( 'oc_bundles_release_order_line' ) ) {
+                    oc_bundles_release_order_line( $order, $line );
+                }
+                $order->remove_item( $bundle_item_id );
+                return null;
+            }
+
+            return true;
+        }
+
+        // ב. יצירה: מוצר המארז לפי bundle.wooProductId, אחר כך sku / productId.
+        $product = $this->resolve_bundle_product_from_payload( $payload_item );
+        if ( ! $product instanceof WC_Product ) {
+            return null; // הנתיב הרגיל: מוצר רגיל / שורה מותאמת + דיווח "לא נמצא".
+        }
+
+        $spec   = $this->build_oc_bundles_spec_from_payload( $order, $product, $quantity, $payload_item );
+        // הצלחה = WC_Order_Item_Product (השורה נוספה ל-$order בזיכרון ועדיין ללא id — נשמרת ב-save של ההזמנה);
+        // כישלון = WP_Error או ערך ריק.
+        $result = oc_bundles_add_order_line( $order, (int) $product->get_id(), (float) $quantity, $spec );
+        if ( $result instanceof WC_Order_Item_Product ) {
+            return true;
+        }
+        if ( is_wp_error( $result ) || ! $result ) {
+            $this->oc_storeos_wc_log(
+                'warning',
+                sprintf(
+                    'Incoming REST: oc_bundles_add_order_line failed on order %d for bundle product %d (%s); item added through the regular product path.',
+                    $order_id,
+                    (int) $product->get_id(),
+                    is_wp_error( $result ) ? $result->get_error_code() . ': ' . $result->get_error_message() : 'no order line returned'
+                ),
+                array( 'order_id' => $order_id )
+            );
+            return null;
+        }
+
+        return true; // ערך אמת אחר (למשל item id מגרסה ישנה של OC Bundles) — נחשב הצלחה.
+    }
+
+    /**
+     * מוצר המארז עבור שורת `bundle` נכנסת: bundle.wooProductId, אחר כך sku, אחר כך productId.
+     * מוצר שאינו מארז (oc_bundles_is_bundle_product) נדחה — הנתיב הרגיל יוסיף אותו כמוצר רגיל.
+     *
+     * @param array $payload_item איבר מתוך `items` (עם מפתח `bundle`).
+     * @return WC_Product|null
+     */
+    protected function resolve_bundle_product_from_payload( array $payload_item ) {
+        $bundle     = ( isset( $payload_item['bundle'] ) && is_array( $payload_item['bundle'] ) ) ? $payload_item['bundle'] : array();
+        $candidates = array();
+
+        if ( isset( $bundle['wooProductId'] ) && is_numeric( $bundle['wooProductId'] ) && (int) $bundle['wooProductId'] > 0 ) {
+            $candidates[] = (int) $bundle['wooProductId'];
+        }
+        if ( ! empty( $payload_item['sku'] ) && function_exists( 'wc_get_product_id_by_sku' ) ) {
+            $pid = wc_get_product_id_by_sku( (string) $payload_item['sku'] );
+            if ( $pid ) {
+                $candidates[] = (int) $pid;
+            }
+        }
+        if ( isset( $payload_item['productId'] ) && is_numeric( $payload_item['productId'] ) && (int) $payload_item['productId'] > 0 ) {
+            $candidates[] = (int) $payload_item['productId'];
+        }
+
+        foreach ( array_unique( $candidates ) as $pid ) {
+            $product = wc_get_product( $pid );
+            if ( ! $product instanceof WC_Product ) {
+                continue;
+            }
+            if ( function_exists( 'oc_bundles_is_bundle_product' ) && ! oc_bundles_is_bundle_product( $product ) ) {
+                continue;
+            }
+            return $product;
+        }
+
+        return null;
+    }
+
+    /**
+     * $spec ל-oc_bundles_add_order_line / oc_bundles_update_order_line (BUNDLES_SYNC_SPEC §5.6) מתוך
+     * שורת payload נכנסת: components (index/key/product_id/variation_id/surcharge/actual_qty),
+     * line_total (lineTotal או unitPrice×quantity, נטו לפי אותו פילטר מע"מ כמו שאר השורות) ו-external_id.
+     * כש-line_total ניתן OC Bundles קובע את subtotal+total לפיו ולא מתמחר מחדש — Giorgio בעל המחיר.
+     *
+     * @param WC_Order        $order        ההזמנה.
+     * @param WC_Product|null $product      מוצר המארז (ל-tax_class), או null.
+     * @param float           $quantity     כמות מארזים.
+     * @param array           $payload_item איבר מתוך `items` (עם מפתח `bundle`).
+     * @return array
+     */
+    protected function build_oc_bundles_spec_from_payload( WC_Order $order, $product, $quantity, array $payload_item ) {
+        $bundle     = ( isset( $payload_item['bundle'] ) && is_array( $payload_item['bundle'] ) ) ? $payload_item['bundle'] : array();
+        $components = array();
+
+        if ( isset( $bundle['components'] ) && is_array( $bundle['components'] ) ) {
+            foreach ( $bundle['components'] as $c ) {
+                if ( ! is_array( $c ) ) {
+                    continue;
+                }
+                $entry = array();
+                if ( isset( $c['index'] ) && is_numeric( $c['index'] ) ) {
+                    $entry['index'] = (int) $c['index'];
+                }
+                if ( isset( $c['key'] ) && is_scalar( $c['key'] ) && '' !== trim( (string) $c['key'] ) ) {
+                    $entry['key'] = sanitize_text_field( (string) $c['key'] );
+                }
+                if ( ! isset( $entry['index'] ) && ! isset( $entry['key'] ) ) {
+                    continue; // בלי index/key אין למה להתאים את החריץ.
+                }
+                if ( isset( $c['productId'] ) && is_numeric( $c['productId'] ) && (int) $c['productId'] > 0 ) {
+                    $entry['product_id']   = (int) $c['productId'];
+                    $entry['variation_id'] = ( isset( $c['variationId'] ) && is_numeric( $c['variationId'] ) ) ? (int) $c['variationId'] : 0;
+                }
+                if ( isset( $c['surcharge'] ) && is_numeric( $c['surcharge'] ) ) {
+                    $entry['surcharge'] = (float) $c['surcharge'];
+                }
+                // BUNDLES_SYNC_SPEC §5.6/§6: המפתח actualQty נשלח תמיד; ערך מספרי = כמות שקולה, null (או לא-מספרי)
+                // = ניקוי הכמות השקולה. רק היעדר המפתח משאיר את הכמות הקיימת ב-Woo כפי שהיא.
+                if ( array_key_exists( 'actualQty', $c ) ) {
+                    $entry['actual_qty'] = is_numeric( $c['actualQty'] ) ? (float) $c['actualQty'] : null;
+                }
+                $components[] = $entry;
+            }
+        }
+
+        $external_id = null;
+        if ( isset( $bundle['externalId'] ) && is_scalar( $bundle['externalId'] ) ) {
+            $external_id = sanitize_text_field( (string) $bundle['externalId'] );
+            if ( '' === $external_id ) {
+                $external_id = null;
+            }
+        }
+
+        return array(
+            'components'  => $components,
+            'line_total'  => $this->get_storeos_rest_payload_line_net_total( $order, $product, $quantity, $payload_item ),
+            'external_id' => $external_id,
+        );
+    }
+
+    /**
+     * סכום השורה נטו מתוך payload נכנס (lineTotal / line_total / unitPrice×quantity / unit_price×quantity),
+     * עם אותו טיפול במע"מ כמו add_storeos_rest_order_line_from_payload (פילטר
+     * `oc_storeos_rest_item_line_amount_includes_tax`). null כשאין סכום תקין.
+     *
+     * @param WC_Order        $order        ההזמנה.
+     * @param WC_Product|null $product      המוצר (ל-tax_class / is_taxable), או null.
+     * @param float           $quantity     כמות.
+     * @param array           $payload_item איבר מתוך `items`.
+     * @return float|null
+     */
+    protected function get_storeos_rest_payload_line_net_total( WC_Order $order, $product, $quantity, array $payload_item ) {
+        $raw = null;
+        if ( isset( $payload_item['lineTotal'] ) && is_numeric( $payload_item['lineTotal'] ) ) {
+            $raw = (float) $payload_item['lineTotal'];
+        } elseif ( isset( $payload_item['line_total'] ) && is_numeric( $payload_item['line_total'] ) ) {
+            $raw = (float) $payload_item['line_total'];
+        } elseif ( isset( $payload_item['unitPrice'] ) && is_numeric( $payload_item['unitPrice'] ) ) {
+            $raw = (float) $payload_item['unitPrice'] * (float) $quantity;
+        } elseif ( isset( $payload_item['unit_price'] ) && is_numeric( $payload_item['unit_price'] ) ) {
+            $raw = (float) $payload_item['unit_price'] * (float) $quantity;
+        }
+
+        if ( null === $raw || $raw < 0 ) {
+            return null;
+        }
+
+        $product  = $product instanceof WC_Product ? $product : null;
+        $decimals = wc_get_price_decimals();
+        $amount   = wc_format_decimal( $raw, $decimals );
+
+        $includes_tax = (bool) apply_filters(
+            'oc_storeos_rest_item_line_amount_includes_tax',
+            false,
+            $payload_item,
+            $product,
+            $order
+        );
+
+        $net_line = $amount;
+        if ( $includes_tax && wc_tax_enabled() && class_exists( 'WC_Tax' ) && ( null === $product || $product->is_taxable() ) ) {
+            $rates_kw = array(
+                'country'   => $order->get_shipping_country() ? $order->get_shipping_country() : $order->get_billing_country(),
+                'state'     => $order->get_shipping_state() ? $order->get_shipping_state() : $order->get_billing_state(),
+                'postcode'  => $order->get_shipping_postcode() ? $order->get_shipping_postcode() : $order->get_billing_postcode(),
+                'city'      => $order->get_shipping_city() ? $order->get_shipping_city() : $order->get_billing_city(),
+                'tax_class' => null !== $product ? $product->get_tax_class() : '',
+            );
+            $tax_rates = WC_Tax::find_rates( $rates_kw );
+            if ( ! empty( $tax_rates ) ) {
+                $tax_parts = WC_Tax::calc_tax( $amount, $tax_rates, true );
+                $net_line  = wc_format_decimal( $amount - array_sum( $tax_parts ), $decimals );
+            }
+        }
+
+        return (float) $net_line;
+    }
+
+    /**
      * Cardcom capture state for an order, read from the gateway's own flag.
      *
      * woo-cardcom-payment-gateway keeps {@see META_CARDCOM_CHARGE_CAPTURED} at 'no' while a J5 hold is
@@ -1602,6 +1922,7 @@ class OC_StoreOS_Integration {
             $items_added            = 0;
             $items_unresolved_keys  = array();
             $deferred_wc_status     = null;
+            $existing_bundle_lines  = array(); // מארזים (OC Bundles): item id => שורת מארז קיימת שמתעדכנת במקום.
 
             // אם נשלח order_id / orderId / orderNumber – ננסה לעדכן הזמנה קיימת במקום ליצור חדשה.
             // (orderNumber — מפתח כמו ב-payload מול Giorgio; בפלגין היוצא orderNumber הוא get_id().)
@@ -1641,7 +1962,23 @@ class OC_StoreOS_Integration {
                 }
 
                 // ננקה פריטי מוצר קיימים לפני שנוסיף מה‑payload החדש.
+                // מארזים (OC Bundles): שורת מארז ש-Giorgio מחזיר עם bundle.itemId תואם נשארת ומתעדכנת
+                // במקום (שלב 3); שורות הפיצול שלה (רכיבים לחשבונית) כן נמחקות — העדכון מפצל מחדש.
+                $existing_bundle_lines = $this->collect_storeos_rest_bundle_lines_to_update( $order, $data );
                 foreach ( $order->get_items() as $item_id => $item ) {
+                    if ( isset( $existing_bundle_lines[ (int) $item_id ] ) ) {
+                        continue;
+                    }
+                    // שורת מארז שלא נשארת (אין itemId תואם / כמות 0): מחזירים למלאי הרכיבים את מה שלקחה
+                    // לפני ההסרה — OC Bundles מנהל מלאי רכיבים בעצמו וה-hooks של WooCommerce לא רואים אותם.
+                    if (
+                        function_exists( 'oc_bundles_release_order_line' )
+                        && function_exists( 'oc_bundles_is_bundle_order_item' )
+                        && $item instanceof WC_Order_Item_Product
+                        && oc_bundles_is_bundle_order_item( $item )
+                    ) {
+                        oc_bundles_release_order_line( $order, $item );
+                    }
                     $order->remove_item( $item_id );
                 }
                 // ננקה גם שורות Fee שליליות (הנחות, למשל "5% הנחת לקוח מועדון"): Giorgio מחזיר את
@@ -1749,6 +2086,13 @@ class OC_StoreOS_Integration {
                         continue;
                     }
                     ++$items_eligible;
+
+                    // מארז (OC Bundles, BUNDLES_SYNC_SPEC §6): עדכון במקום / יצירה דרך oc_bundles_*.
+                    // null = לא טופל כאן (לא מארז, OC Bundles לא פעיל, או כשל) → ממשיכים בנתיב הרגיל.
+                    if ( true === $this->handle_storeos_rest_bundle_line_from_payload( $order, $item, $quantity, $existing_bundle_lines ) ) {
+                        ++$items_added;
+                        continue;
+                    }
 
                     // Guard against productId "0"/empty: wc_get_product( 0 ) resolves to the global/current
                     // product, which would attach a wrong product's name + image to a "general product" line.
@@ -5044,9 +5388,18 @@ class OC_StoreOS_Integration {
         $shipping_apartment  = $this->resolve_shipping_or_billing_meta( $order, '_shipping_apartment', '_billing_apartment' );
         $shipping_enter_code = $this->resolve_shipping_or_billing_meta( $order, '_shipping_enter_code', '_billing_enter_code' );
 
+        // מארזים (OC Bundles): הכסף שהפיצול לחשבונית העביר לשורות הרכיבים חוזר לשורת המארז (ראה helper).
+        $bundle_split_totals = $this->get_bundle_split_line_totals_by_parent( $order );
+
         $items_payload = array();
         foreach ( $order->get_items() as $item ) {
             if ( ! $item instanceof WC_Order_Item_Product ) {
+                continue;
+            }
+
+            // מארזים (OC Bundles): שורות הפיצול של רכיבי המארז (_oc_bundle_component_of) הן פנימיות
+            // לשורת המארז ולא נשלחות כפריטים — Giorgio מקבל את הרכיבים בתוך `bundle` (BUNDLES_SYNC_SPEC §6).
+            if ( function_exists( 'oc_bundles_is_component_line' ) && oc_bundles_is_component_line( $item ) ) {
                 continue;
             }
 
@@ -5054,6 +5407,10 @@ class OC_StoreOS_Integration {
             $line_name    = $this->get_storeos_line_item_display_name( $item, $options );
             $quantity   = (float) $item->get_quantity();
             $line_total = (float) $item->get_total();
+
+            if ( isset( $bundle_split_totals[ (int) $item->get_id() ] ) ) {
+                $line_total += (float) $bundle_split_totals[ (int) $item->get_id() ];
+            }
 
             $unit_price = $quantity > 0 ? $line_total / $quantity : 0;
 
@@ -5150,7 +5507,7 @@ class OC_StoreOS_Integration {
 
             $storeos_qty = $this->get_order_line_storeos_quantity_fields( $item );
 
-            $items_payload[] = array(
+            $line_payload = array(
                 'productId'   => $item->get_product_id(),
                 'name'        => $line_name,
                 'sku'         => $sku,
@@ -5169,7 +5526,17 @@ class OC_StoreOS_Integration {
                     'variationId' => $variation_id ?: null,
                     'attributes'  => $variation_attrs_for_json,
                 ),
+                // מזהה שורת ההזמנה ב-WC: Giorgio מחזיר אותו כ-bundle.itemId כדי לעדכן שורת מארז במקום (§6).
+                'itemId'      => (int) $item->get_id(),
             );
+
+            // מארז (OC Bundles): אובייקט `bundle` ברמת השורה (BUNDLES_SYNC_SPEC §6).
+            $bundle_payload = $this->build_order_line_bundle_payload( $item );
+            if ( null !== $bundle_payload ) {
+                $line_payload['bundle'] = $bundle_payload;
+            }
+
+            $items_payload[] = $line_payload;
         }
 
         // Map WooCommerce status to external API expectations.
@@ -5294,6 +5661,142 @@ class OC_StoreOS_Integration {
         }
         
         return $payload;
+    }
+
+    /**
+     * מארזים (OC Bundles) עם invoice_display=components: הפיצול לחשבונית מעביר כסף משורת המארז לשורות
+     * רכיבים סינתטיות (_oc_bundle_component_of). ב-payload ל-Giorgio שורות הפיצול לא נשלחות ושורת
+     * המארז היא הכסף (BUNDLES_SYNC_SPEC §2/§6), לכן הסכום שעבר חוזר אליה.
+     *
+     * התאמה לפי _oc_bundle_parent_item (מזהה שורת האב, OC Bundles 1.5.0). שורות פיצול ישנות בלי המטא
+     * הזה משויכות לפי מזהה מוצר המארז — רק כשיש שורת מארז אחת עם אותו מוצר (אחרת אין שיוך חד-משמעי).
+     *
+     * @param WC_Order $order Order.
+     * @return array parent item id => float (סכום שורות הפיצול של אותה שורת מארז). ריק כש-OC Bundles לא פעיל.
+     */
+    protected function get_bundle_split_line_totals_by_parent( WC_Order $order ) {
+        if ( ! function_exists( 'oc_bundles_is_component_line' ) || ! function_exists( 'oc_bundles_is_bundle_order_item' ) ) {
+            return array();
+        }
+
+        $totals              = array();
+        $legacy_by_product   = array();
+        $bundle_lines_by_pid = array();
+
+        foreach ( $order->get_items() as $item_id => $item ) {
+            if ( ! $item instanceof WC_Order_Item_Product ) {
+                continue;
+            }
+
+            if ( oc_bundles_is_component_line( $item ) ) {
+                $amount    = (float) $item->get_total();
+                $parent_id = (int) $item->get_meta( '_oc_bundle_parent_item', true );
+                if ( $parent_id > 0 ) {
+                    $totals[ $parent_id ] = ( isset( $totals[ $parent_id ] ) ? $totals[ $parent_id ] : 0.0 ) + $amount;
+                } else {
+                    $pid = (int) $item->get_meta( '_oc_bundle_component_of', true );
+                    if ( $pid > 0 ) {
+                        $legacy_by_product[ $pid ] = ( isset( $legacy_by_product[ $pid ] ) ? $legacy_by_product[ $pid ] : 0.0 ) + $amount;
+                    }
+                }
+                continue;
+            }
+
+            if ( oc_bundles_is_bundle_order_item( $item ) ) {
+                $bundle_lines_by_pid[ (int) $item->get_product_id() ][] = (int) $item_id;
+            }
+        }
+
+        foreach ( $legacy_by_product as $pid => $amount ) {
+            if ( isset( $bundle_lines_by_pid[ $pid ] ) && 1 === count( $bundle_lines_by_pid[ $pid ] ) ) {
+                $parent_id            = $bundle_lines_by_pid[ $pid ][0];
+                $totals[ $parent_id ] = ( isset( $totals[ $parent_id ] ) ? $totals[ $parent_id ] : 0.0 ) + $amount;
+            }
+        }
+
+        return $totals;
+    }
+
+    /**
+     * אובייקט `bundle` לשורת מארז ב-payload היוצא (BUNDLES_SYNC_SPEC §6): המרה ממערך ה-snake_case של
+     * oc_bundles_get_order_item_bundle_data() לצורת ה-camelCase ש-Giorgio מצפה לה.
+     * מספרים כ-float/int, null נשאר null.
+     *
+     * @param WC_Order_Item_Product $item שורת הזמנה.
+     * @return array|null null כש-OC Bundles לא פעיל או כשהשורה אינה שורת מארז.
+     */
+    protected function build_order_line_bundle_payload( WC_Order_Item_Product $item ) {
+        if ( ! function_exists( 'oc_bundles_get_order_item_bundle_data' ) ) {
+            return null;
+        }
+
+        $data = oc_bundles_get_order_item_bundle_data( $item );
+        if ( ! is_array( $data ) ) {
+            return null;
+        }
+
+        $components = array();
+        if ( isset( $data['components'] ) && is_array( $data['components'] ) ) {
+            foreach ( $data['components'] as $index => $c ) {
+                if ( ! is_array( $c ) ) {
+                    continue;
+                }
+                $components[] = array(
+                    'index'                  => ( isset( $c['index'] ) && is_numeric( $c['index'] ) ) ? (int) $c['index'] : (int) $index,
+                    'key'                    => isset( $c['key'] ) ? (string) $c['key'] : '',
+                    'productId'              => isset( $c['product_id'] ) ? (int) $c['product_id'] : 0,
+                    'variationId'            => isset( $c['variation_id'] ) ? (int) $c['variation_id'] : 0,
+                    'sku'                    => isset( $c['sku'] ) ? (string) $c['sku'] : '',
+                    'name'                   => isset( $c['name'] ) ? (string) $c['name'] : '',
+                    'qty'                    => ( isset( $c['qty'] ) && is_numeric( $c['qty'] ) ) ? (float) $c['qty'] : 0.0,
+                    'unit'                   => isset( $c['unit'] ) ? (string) $c['unit'] : null,
+                    'mode'                   => isset( $c['mode'] ) ? (string) $c['mode'] : null,
+                    'unitWeight'             => $this->bundle_payload_float_or_null( $c, 'unit_weight' ),
+                    'swappedFromProductId'   => $this->bundle_payload_id_or_null( $c, 'swapped_from_product_id' ),
+                    'swappedFromVariationId' => $this->bundle_payload_id_or_null( $c, 'swapped_from_variation_id' ),
+                    'surcharge'              => ( isset( $c['surcharge'] ) && is_numeric( $c['surcharge'] ) ) ? (float) $c['surcharge'] : 0.0,
+                    'actualQty'              => $this->bundle_payload_float_or_null( $c, 'actual_qty' ),
+                    'description'            => isset( $c['description'] ) ? (string) $c['description'] : '',
+                );
+            }
+        }
+
+        $external_id = ( isset( $data['external_id'] ) && '' !== (string) $data['external_id'] ) ? (string) $data['external_id'] : null;
+        $item_id     = ( isset( $data['item_id'] ) && (int) $data['item_id'] > 0 ) ? (int) $data['item_id'] : (int) $item->get_id();
+        $woo_pid     = ( isset( $data['woo_product_id'] ) && (int) $data['woo_product_id'] > 0 ) ? (int) $data['woo_product_id'] : (int) $item->get_product_id();
+
+        return array(
+            'externalId'     => $external_id,
+            'wooProductId'   => $woo_pid,
+            'itemId'         => $item_id,
+            'pricingMode'    => isset( $data['pricing_mode'] ) ? (string) $data['pricing_mode'] : 'fixed',
+            'reweighPrice'   => ! empty( $data['reweigh_price'] ),
+            'invoiceDisplay' => isset( $data['invoice_display'] ) ? (string) $data['invoice_display'] : 'bundle',
+            'basePrice'      => ( isset( $data['base_price'] ) && is_numeric( $data['base_price'] ) ) ? (float) $data['base_price'] : 0.0,
+            'components'     => $components,
+        );
+    }
+
+    /**
+     * מזהה חיובי מתוך מערך, או null (0 / ריק / לא מספרי = null).
+     *
+     * @param array  $row מערך מקור.
+     * @param string $key מפתח.
+     * @return int|null
+     */
+    protected function bundle_payload_id_or_null( array $row, $key ) {
+        return ( isset( $row[ $key ] ) && is_numeric( $row[ $key ] ) && (int) $row[ $key ] > 0 ) ? (int) $row[ $key ] : null;
+    }
+
+    /**
+     * ערך מספרי מתוך מערך כ-float, או null כשאינו מספרי / חסר.
+     *
+     * @param array  $row מערך מקור.
+     * @param string $key מפתח.
+     * @return float|null
+     */
+    protected function bundle_payload_float_or_null( array $row, $key ) {
+        return ( isset( $row[ $key ] ) && is_numeric( $row[ $key ] ) ) ? (float) $row[ $key ] : null;
     }
 
     /**
