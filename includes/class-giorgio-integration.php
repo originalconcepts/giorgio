@@ -1335,6 +1335,16 @@ class OC_StoreOS_Integration {
                 if ( isset( $c['surcharge'] ) && is_numeric( $c['surcharge'] ) ) {
                     $entry['surcharge'] = (float) $c['surcharge'];
                 }
+                // רכיב שהוחלף: Giorgio שולח את הכמות למארז והיחידה של השורה כפי שהיא אצלו (חלופה עם כמות משלה,
+                // או החלפה למוצר שנמדד אחרת - 2 מנות של 0.2 ק"ג -> 0.4 ק"ג). OC Bundles 1.5.2+ מכבד אותם.
+                if ( isset( $c['swappedFromProductId'] ) && is_numeric( $c['swappedFromProductId'] ) && (int) $c['swappedFromProductId'] > 0 ) {
+                    if ( isset( $c['qty'] ) && is_numeric( $c['qty'] ) && (float) $c['qty'] > 0 ) {
+                        $entry['qty'] = (float) $c['qty'];
+                    }
+                    if ( isset( $c['unit'] ) && is_scalar( $c['unit'] ) && in_array( (string) $c['unit'], array( 'kg', 'grams', 'unit' ), true ) ) {
+                        $entry['unit'] = (string) $c['unit'];
+                    }
+                }
                 // BUNDLES_SYNC_SPEC §5.6/§6: המפתח actualQty נשלח תמיד; ערך מספרי = כמות שקולה, null (או לא-מספרי)
                 // = ניקוי הכמות השקולה. רק היעדר המפתח משאיר את הכמות הקיימת ב-Woo כפי שהיא.
                 if ( array_key_exists( 'actualQty', $c ) ) {
