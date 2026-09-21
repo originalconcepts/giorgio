@@ -1098,6 +1098,44 @@ class OC_StoreOS_Integration {
     }
 
     /**
+     * OC Bundles בגרסה שתומכת בסנכרון המארזים של Giorgio (BUNDLES_SYNC_SPEC §5.6): ה-API של שורות ההזמנה
+     * קיים, והגרסה 1.5.2+ (qty/unit של רכיב שהוחלף, line_total שנשמר). בדיקת function_exists לבדה לא מספיקה:
+     * גרסה ישנה יותר עם אותן פונקציות זורקת בשקט את השדות החדשים והמשקלים מסתנכרנים שגוי - במקרה כזה
+     * חוזרים להתנהגות הקודמת (המארז נכנס כמוצר רגיל) ורושמים אזהרה פעם אחת לבקשה.
+     *
+     * @return bool
+     */
+    protected function oc_bundles_supports_giorgio_sync() {
+        if (
+            ! function_exists( 'oc_bundles_is_bundle_order_item' )
+            || ! function_exists( 'oc_bundles_update_order_line' )
+            || ! function_exists( 'oc_bundles_add_order_line' )
+        ) {
+            return false;
+        }
+        if ( defined( 'OC_BUNDLES_VERSION' ) && version_compare( (string) OC_BUNDLES_VERSION, '1.5.2', '>=' ) ) {
+            return true;
+        }
+        if ( ! $this->oc_bundles_version_warning_logged ) {
+            $this->oc_bundles_version_warning_logged = true;
+            $this->oc_storeos_wc_log(
+                'warning',
+                sprintf(
+                    'OC Bundles %s is older than 1.5.2 - bundle lines from Giorgio are handled as regular products until it is updated.',
+                    defined( 'OC_BUNDLES_VERSION' ) ? (string) OC_BUNDLES_VERSION : '(unknown version)'
+                )
+            );
+        }
+        return false;
+    }
+
+    /** @var bool אזהרת גרסת OC Bundles נרשמת פעם אחת לבקשה. */
+    protected $oc_bundles_version_warning_logged = false;
+
+    /** @var array bundle.itemId שכבר טופלו בבקשה הנוכחית (מפתח = item id). */
+    protected $handled_bundle_item_ids = array();
+
+    /**
      * מארזים (OC Bundles) בעדכון הזמנה קיימת מ-Giorgio (BUNDLES_SYNC_SPEC §6): שורות מארז קיימות
      * ש-Giorgio מחזיר עם bundle.itemId תואם (וכמות > 0) מתעדכנות במקום (oc_bundles_update_order_line)
      * ולא נמחקות בבנייה ההורסת. שורות הפיצול שלהן (_oc_bundle_component_of) אינן נשמרות — הן נמחקות
@@ -1108,9 +1146,9 @@ class OC_StoreOS_Integration {
      * @return array item id => WC_Order_Item_Product — שורות מארז שיש להשאיר ולעדכן.
      */
     protected function collect_storeos_rest_bundle_lines_to_update( WC_Order $order, array $data ) {
+        $this->handled_bundle_item_ids = array();
         if (
-            ! function_exists( 'oc_bundles_is_bundle_order_item' )
-            || ! function_exists( 'oc_bundles_update_order_line' )
+            ! $this->oc_bundles_supports_giorgio_sync()
             || empty( $data['items'] )
             || ! is_array( $data['items'] )
         ) {
@@ -1182,18 +1220,46 @@ class OC_StoreOS_Integration {
         if ( empty( $payload_item['bundle'] ) || ! is_array( $payload_item['bundle'] ) ) {
             return null;
         }
-        if ( ! function_exists( 'oc_bundles_add_order_line' ) || ! function_exists( 'oc_bundles_update_order_line' ) ) {
-            return null; // OC Bundles לא פעיל — השורה נוספת כמוצר רגיל (התנהגות קודמת).
+        if ( ! $this->oc_bundles_supports_giorgio_sync() ) {
+            return null; // OC Bundles לא פעיל / ישן מ-1.5.2 — השורה נוספת כמוצר רגיל (התנהגות קודמת).
         }
 
         $bundle         = $payload_item['bundle'];
         $order_id       = (int) $order->get_id();
         $bundle_item_id = ( isset( $bundle['itemId'] ) && is_numeric( $bundle['itemId'] ) ) ? (int) $bundle['itemId'] : 0;
 
+        // מארזים נמכרים ביחידות שלמות בלבד (Giorgio אוכף זאת). כמות שבורה הייתה נחתכת ל-0 ב-set_quantity
+        // (wc_stock_amount) ומשאירה שורת מארז בלי כמות - מעגלים, ולפחות 1.
+        $quantity = max( 1, (int) round( (float) $quantity ) );
+
+        // אותו bundle.itemId פעמיים באותה בקשה: הראשון עדכן את השורה; השני היה נופל לנתיב היצירה ומוסיף
+        // שורת מארז שנייה שמכפילה את הסכום. מתעלמים ממנו (נחשב "טופל") ורושמים אזהרה.
+        if ( $bundle_item_id > 0 && isset( $this->handled_bundle_item_ids[ $bundle_item_id ] ) ) {
+            $this->oc_storeos_wc_log(
+                'warning',
+                sprintf( 'Incoming REST: bundle itemId %d appears more than once on order %d; the repeated item was ignored.', $bundle_item_id, $order_id ),
+                array( 'order_id' => $order_id )
+            );
+            return true;
+        }
+
         // א. עדכון במקום של שורת מארז קיימת.
         if ( $bundle_item_id > 0 && isset( $existing_bundle_lines[ $bundle_item_id ] ) ) {
             $line = $existing_bundle_lines[ $bundle_item_id ];
             unset( $existing_bundle_lines[ $bundle_item_id ] ); // כל שורה מתעדכנת פעם אחת.
+            $this->handled_bundle_item_ids[ $bundle_item_id ] = true;
+
+            // בלי רשימת components (עדכון חלקי / שולח ישן) oc_bundles_update_order_line בונה כל חריץ מברירת
+            // המחדל של המארז: ההחלפות שהלקוח בחר נמחקות, מלאי משוחרר וסכום השורה משתנה. משאירים את השורה
+            // כמו שהיא - הבחירה של הלקוח חשובה יותר מעדכון שאי אפשר לפרש.
+            if ( ! isset( $bundle['components'] ) || ! is_array( $bundle['components'] ) || empty( $bundle['components'] ) ) {
+                $this->oc_storeos_wc_log(
+                    'warning',
+                    sprintf( 'Incoming REST: bundle item %d on order %d arrived without a components list; the line was kept unchanged.', $bundle_item_id, $order_id ),
+                    array( 'order_id' => $order_id )
+                );
+                return true;
+            }
 
             $spec = $this->build_oc_bundles_spec_from_payload( $order, $line->get_product(), $quantity, $payload_item );
 
@@ -1221,6 +1287,7 @@ class OC_StoreOS_Integration {
                 // בעצמו; ה-hooks של WooCommerce לא רואים אותם).
                 if ( function_exists( 'oc_bundles_release_order_line' ) ) {
                     oc_bundles_release_order_line( $order, $line );
+                    $this->persist_released_bundle_line( $line );
                 }
                 $order->remove_item( $bundle_item_id );
                 return null;
@@ -1257,6 +1324,22 @@ class OC_StoreOS_Integration {
         }
 
         return true; // ערך אמת אחר (למשל item id מגרסה ישנה של OC Bundles) — נחשב הצלחה.
+    }
+
+    /**
+     * אחרי oc_bundles_release_order_line: המלאי של הרכיבים כבר הוחזר (כתיבה מיידית ל-DB), אבל איפוס הרישום של
+     * השורה (ledger) נמצא רק בזיכרון והשורה עצמה נמחקת רק ב-save של ההזמנה בסוף הבנייה מחדש. שגיאה באמצע הייתה
+     * משאירה שורה שעדיין "מחזיקה" מלאי שכבר הוחזר - וכל ניסיון חוזר מחזיר אותו שוב (מלאי מנופח). שמירת השורה
+     * מיד הופכת את ההחזרה לחד-פעמית: בניסיון חוזר הרישום ריק ואין מה להחזיר; שורה שנשארת ומתעדכנת במקום
+     * לוקחת את המלאי מחדש דרך oc_bundles_update_order_line.
+     *
+     * @param WC_Order_Item_Product $item שורת מארז שמלאי הרכיבים שלה שוחרר.
+     * @return void
+     */
+    protected function persist_released_bundle_line( $item ) {
+        if ( $item instanceof WC_Order_Item_Product && $item->get_id() > 0 ) {
+            $item->save();
+        }
     }
 
     /**
@@ -1988,6 +2071,7 @@ class OC_StoreOS_Integration {
                         && oc_bundles_is_bundle_order_item( $item )
                     ) {
                         oc_bundles_release_order_line( $order, $item );
+                        $this->persist_released_bundle_line( $item );
                     }
                     $order->remove_item( $item_id );
                 }
@@ -5678,8 +5762,10 @@ class OC_StoreOS_Integration {
      * רכיבים סינתטיות (_oc_bundle_component_of). ב-payload ל-Giorgio שורות הפיצול לא נשלחות ושורת
      * המארז היא הכסף (BUNDLES_SYNC_SPEC §2/§6), לכן הסכום שעבר חוזר אליה.
      *
-     * התאמה לפי _oc_bundle_parent_item (מזהה שורת האב, OC Bundles 1.5.0). שורות פיצול ישנות בלי המטא
-     * הזה משויכות לפי מזהה מוצר המארז — רק כשיש שורת מארז אחת עם אותו מוצר (אחרת אין שיוך חד-משמעי).
+     * התאמה לפי _oc_bundle_parent_item (מזהה שורת האב), ואחריו לפי ה-uid של שורת המארז
+     * (_oc_bundle_component_parent == _oc_bundle_line_uid, OC Bundles 1.4.7+). שורות פיצול ישנות בלי שני אלה
+     * משויכות לפי מזהה מוצר המארז; כשיש כמה שורות של אותו מארז הסכום מתחלק ביניהן לפי הכמות - כסף שלא
+     * שויך היה נופל מהדיווח ל-Giorgio, וסכום ההזמנה שם יצא נמוך ממה שנגבה.
      *
      * @param WC_Order $order Order.
      * @return array parent item id => float (סכום שורות הפיצול של אותה שורת מארז). ריק כש-OC Bundles לא פעיל.
@@ -5691,7 +5777,10 @@ class OC_StoreOS_Integration {
 
         $totals              = array();
         $legacy_by_product   = array();
+        $by_uid              = array();
         $bundle_lines_by_pid = array();
+        $bundle_line_by_uid  = array();
+        $bundle_line_qty     = array();
 
         foreach ( $order->get_items() as $item_id => $item ) {
             if ( ! $item instanceof WC_Order_Item_Product ) {
@@ -5701,26 +5790,59 @@ class OC_StoreOS_Integration {
             if ( oc_bundles_is_component_line( $item ) ) {
                 $amount    = (float) $item->get_total();
                 $parent_id = (int) $item->get_meta( '_oc_bundle_parent_item', true );
+                $pid       = (int) $item->get_meta( '_oc_bundle_component_of', true );
+                $uid       = (string) $item->get_meta( '_oc_bundle_component_parent', true );
                 if ( $parent_id > 0 ) {
                     $totals[ $parent_id ] = ( isset( $totals[ $parent_id ] ) ? $totals[ $parent_id ] : 0.0 ) + $amount;
-                } else {
-                    $pid = (int) $item->get_meta( '_oc_bundle_component_of', true );
-                    if ( $pid > 0 ) {
-                        $legacy_by_product[ $pid ] = ( isset( $legacy_by_product[ $pid ] ) ? $legacy_by_product[ $pid ] : 0.0 ) + $amount;
-                    }
+                } elseif ( '' !== $uid ) {
+                    $by_uid[] = array( 'uid' => $uid, 'pid' => $pid, 'amount' => $amount );
+                } elseif ( $pid > 0 ) {
+                    $legacy_by_product[ $pid ] = ( isset( $legacy_by_product[ $pid ] ) ? $legacy_by_product[ $pid ] : 0.0 ) + $amount;
                 }
                 continue;
             }
 
             if ( oc_bundles_is_bundle_order_item( $item ) ) {
                 $bundle_lines_by_pid[ (int) $item->get_product_id() ][] = (int) $item_id;
+                $bundle_line_qty[ (int) $item_id ]                      = max( 1.0, (float) $item->get_quantity() );
+                $line_uid = (string) $item->get_meta( '_oc_bundle_line_uid', true );
+                if ( '' !== $line_uid ) {
+                    $bundle_line_by_uid[ $line_uid ] = (int) $item_id;
+                }
+            }
+        }
+
+        // uid: שורת הפיצול מצביעה על ה-uid של שורת המארז. uid שאין לו שורה (נדיר) יורד לשיוך לפי מוצר.
+        foreach ( $by_uid as $row ) {
+            if ( isset( $bundle_line_by_uid[ $row['uid'] ] ) ) {
+                $parent_id            = $bundle_line_by_uid[ $row['uid'] ];
+                $totals[ $parent_id ] = ( isset( $totals[ $parent_id ] ) ? $totals[ $parent_id ] : 0.0 ) + $row['amount'];
+            } elseif ( $row['pid'] > 0 ) {
+                $legacy_by_product[ $row['pid'] ] = ( isset( $legacy_by_product[ $row['pid'] ] ) ? $legacy_by_product[ $row['pid'] ] : 0.0 ) + $row['amount'];
             }
         }
 
         foreach ( $legacy_by_product as $pid => $amount ) {
-            if ( isset( $bundle_lines_by_pid[ $pid ] ) && 1 === count( $bundle_lines_by_pid[ $pid ] ) ) {
-                $parent_id            = $bundle_lines_by_pid[ $pid ][0];
-                $totals[ $parent_id ] = ( isset( $totals[ $parent_id ] ) ? $totals[ $parent_id ] : 0.0 ) + $amount;
+            if ( empty( $bundle_lines_by_pid[ $pid ] ) ) {
+                continue;
+            }
+            $parents = $bundle_lines_by_pid[ $pid ];
+            if ( 1 === count( $parents ) ) {
+                $totals[ $parents[0] ] = ( isset( $totals[ $parents[0] ] ) ? $totals[ $parents[0] ] : 0.0 ) + $amount;
+                continue;
+            }
+            // כמה שורות של אותו מארז בלי קישור: מחלקים לפי הכמות; השארית לשורה האחרונה כדי שהסכום יישמר לאגורה.
+            $qty_sum   = 0.0;
+            foreach ( $parents as $parent_id ) {
+                $qty_sum += $bundle_line_qty[ $parent_id ];
+            }
+            $decimals  = wc_get_price_decimals();
+            $allocated = 0.0;
+            $last      = count( $parents ) - 1;
+            foreach ( $parents as $i => $parent_id ) {
+                $share      = ( $i === $last ) ? $amount - $allocated : round( $amount * $bundle_line_qty[ $parent_id ] / $qty_sum, $decimals );
+                $allocated += $share;
+                $totals[ $parent_id ] = ( isset( $totals[ $parent_id ] ) ? $totals[ $parent_id ] : 0.0 ) + $share;
             }
         }
 
