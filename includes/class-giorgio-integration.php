@@ -1250,15 +1250,31 @@ class OC_StoreOS_Integration {
             $this->handled_bundle_item_ids[ $bundle_item_id ] = true;
 
             // בלי רשימת components (עדכון חלקי / שולח ישן) oc_bundles_update_order_line בונה כל חריץ מברירת
-            // המחדל של המארז: ההחלפות שהלקוח בחר נמחקות, מלאי משוחרר וסכום השורה משתנה. משאירים את השורה
-            // כמו שהיא - הבחירה של הלקוח חשובה יותר מעדכון שאי אפשר לפרש.
+            // המחדל של המארז: ההחלפות שהלקוח בחר נמחקות, מלאי משוחרר וסכום השורה משתנה.
+            // אסור לצאת כאן בלי עדכון: הבנייה מחדש כבר מחקה את שורות הפיצול של המארז (רכיבים לחשבונית) ורק
+            // העדכון יוצר אותן מחדש - שורה שנשארת "כמו שהיא" מחזיקה רק את השארית שאחרי הפיצול, סכום ההזמנה
+            // יורד והחיוב נעשה על הסכום המופחת. לכן בונים את הרשימה מהרכיבים שהשורה עצמה מחזיקה (אותה צורה
+            // ש-Giorgio שולח) והעדכון רץ כרגיל: הבחירה של הלקוח נשמרת, השורה מתפצלת מחדש והסכום נשמר.
             if ( ! isset( $bundle['components'] ) || ! is_array( $bundle['components'] ) || empty( $bundle['components'] ) ) {
+                $existing_payload = $this->build_order_line_bundle_payload( $line );
+                $existing_components = ( is_array( $existing_payload ) && ! empty( $existing_payload['components'] ) && is_array( $existing_payload['components'] ) )
+                    ? $existing_payload['components']
+                    : array();
+                // actualQty של השורה הקיימת נשאר כפי שהוא ב-Woo: רק מפתח שנשלח במפורש מעדכן/מנקה אותו.
+                foreach ( $existing_components as $ci => $existing_component ) {
+                    unset( $existing_components[ $ci ]['actualQty'] );
+                }
+                $payload_item['bundle']['components'] = $existing_components;
                 $this->oc_storeos_wc_log(
                     'warning',
-                    sprintf( 'Incoming REST: bundle item %d on order %d arrived without a components list; the line was kept unchanged.', $bundle_item_id, $order_id ),
+                    sprintf(
+                        'Incoming REST: bundle item %d on order %d arrived without a components list; the update was rebuilt from the %d component(s) already on the line.',
+                        $bundle_item_id,
+                        $order_id,
+                        count( $existing_components )
+                    ),
                     array( 'order_id' => $order_id )
                 );
-                return true;
             }
 
             $spec = $this->build_oc_bundles_spec_from_payload( $order, $line->get_product(), $quantity, $payload_item );
@@ -1307,6 +1323,17 @@ class OC_StoreOS_Integration {
         // כישלון = WP_Error או ערך ריק.
         $result = oc_bundles_add_order_line( $order, (int) $product->get_id(), (float) $quantity, $spec );
         if ( $result instanceof WC_Order_Item_Product ) {
+            // itemId שלא התאים לשורה קיימת ומופיע שוב באותה בקשה היה יוצר שורת מארז שנייה (סכום כפול).
+            if ( $bundle_item_id > 0 ) {
+                $this->handled_bundle_item_ids[ $bundle_item_id ] = true;
+            }
+            // OC Bundles לקח את מלאי הרכיבים בכתיבה מיידית, אבל לשורה חדשה עדיין אין id - הרישום (ledger) קיים
+            // רק בזיכרון. כישלון לפני ה-save של ההזמנה משאיר מלאי שנלקח בלי שורה שמחזיקה אותו, וניסיון חוזר
+            // לוקח שוב. שומרים את השורה כבר עכשיו: בניסיון חוזר היא תימצא, תשוחרר ותיבנה מחדש.
+            if ( $result->get_id() <= 0 && $order->get_id() > 0 ) {
+                $result->set_order_id( (int) $order->get_id() );
+                $result->save();
+            }
             return true;
         }
         if ( is_wp_error( $result ) || ! $result ) {
@@ -2512,7 +2539,7 @@ class OC_StoreOS_Integration {
             }
 
             return new WP_REST_Response( $response_body, $http_status );
-        } catch ( Exception $e ) {
+        } catch ( Throwable $e ) {
             $this->log_rest_incoming_order(
                 array(
                     'time_utc'  => gmdate( 'c' ),
