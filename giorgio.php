@@ -3,7 +3,7 @@
  * Plugin Name: OC Giorgio Integration
  * Plugin URI: https://onlinestore.co.il
  * Description: Two-way order sync between WooCommerce and the Giorgio platform.
- * Version: 1.10.3
+ * Version: 1.11.0
  * Author: Original Concepts
  * Author URI: https://onlinestore.co.il
  * Text Domain: oc-storeos-integration
@@ -13,7 +13,7 @@ if ( ! defined( 'ABSPATH' ) ) {
     exit;
 }
 
-define( 'OC_STOREOS_INTEGRATION_VERSION', '1.10.3' );
+define( 'OC_STOREOS_INTEGRATION_VERSION', '1.11.0' );
 define( 'OC_STOREOS_INTEGRATION_PLUGIN_FILE', __FILE__ );
 define( 'OC_STOREOS_INTEGRATION_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
 
@@ -398,6 +398,7 @@ new OC_StoreOS_Integration_Updater();
 
 require_once OC_STOREOS_INTEGRATION_PLUGIN_DIR . 'includes/class-giorgio-integration.php';
 require_once OC_STOREOS_INTEGRATION_PLUGIN_DIR . 'includes/class-giorgio-ed-product-rest.php';
+require_once OC_STOREOS_INTEGRATION_PLUGIN_DIR . 'includes/class-giorgio-attribute-term-order.php';
 
 // Declare compatibility with WooCommerce High-Performance Order Storage (custom order tables).
 add_action(
@@ -419,6 +420,8 @@ add_action(
         if ( class_exists( 'WooCommerce' ) ) {
             $integration = OC_StoreOS_Integration::get_instance();
             new OC_Giorgio_ED_Product_REST( $integration );
+            // Mirrors the REST term order (order_pa_*) into the storefront sort meta (order); see the class doc.
+            new OC_Giorgio_Attribute_Term_Order();
         }
     }
 );
