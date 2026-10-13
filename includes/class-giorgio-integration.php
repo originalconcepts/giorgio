@@ -5357,11 +5357,11 @@ class OC_StoreOS_Integration {
      *
      * Per-line breakdown (`lines[]`): derived from what WooCommerce actually charged — each order line's
      * `subtotal` (pre-discount) minus `total` (charged). This is the source of truth for Giorgio's per-line
-     * stamping. Because the Promotion Engine aggregates line discounts across promotions (it does not tag
-     * each discounted line with the owning promotion), we only attach `lines[]` when a single promotion is
-     * applied; for multiple promotions we send the order-level `discountAmount` only and let Giorgio
-     * distribute it (which it does as a fallback). The order-level `discountAmount` stays the engine's
-     * reported `saved` so existing behaviour is unchanged.
+     * stamping. Promotion Engine >= 0.9.30 tags each discounted order line with the owning promotion
+     * (`_promeng_promo_discounts` item meta), so `lines[]` is attributed per promotion even when several
+     * promotions applied. With an older engine the attribution is only possible for a single applied
+     * promotion; for multiple promotions we then send the order-level `discountAmount` only and let Giorgio
+     * distribute it. The order-level `discountAmount` stays the engine's reported `saved`.
      *
      * @param WC_Order $order Order object.
      * @return array
@@ -5393,6 +5393,35 @@ class OC_StoreOS_Integration {
         }
         $single_promo = ( 1 === count( $applied ) );
 
+        // Promotion Engine >= 0.9.30 stamps each discounted line with the promotion that produced its
+        // discount (hidden item meta `_promeng_promo_discounts` = [ promotion_id => amount ]). With it,
+        // lines[] can be attributed per promotion on multi-promotion orders as well; without it Giorgio
+        // had to spread each promotion over every line and overcharged non-promo lines at picking
+        // (הקצב בעיר #3386).
+        $lines_by_promotion = array();
+        foreach ( $order->get_items() as $item ) {
+            if ( ! $item instanceof WC_Order_Item_Product ) {
+                continue;
+            }
+            $owners = $item->get_meta( '_promeng_promo_discounts', true );
+            if ( ! is_array( $owners ) || empty( $owners ) ) {
+                continue;
+            }
+            $product = $item->get_product();
+            foreach ( $owners as $owner_promotion_id => $amount ) {
+                $amount = round( (float) $amount, 2 );
+                if ( $amount <= 0.0 ) {
+                    continue;
+                }
+                $lines_by_promotion[ (int) $owner_promotion_id ][] = array(
+                    'productId'        => (int) $item->get_product_id(),
+                    'sku'              => $product instanceof WC_Product ? (string) $product->get_sku() : '',
+                    'quantityAffected' => (float) $item->get_quantity(),
+                    'discountAmount'   => $amount,
+                );
+            }
+        }
+
         foreach ( $applied as $promotion_id => $info ) {
             if ( ! is_array( $info ) ) {
                 continue;
@@ -5408,8 +5437,11 @@ class OC_StoreOS_Integration {
                 'discountAmount' => isset( $info['saved'] ) ? (float) $info['saved'] : 0.0,
                 'lines'          => array(),
             );
-            // Only attribute per-line discounts to a single applied promotion (see method doc).
-            if ( $single_promo && ! empty( $order_line_discounts ) ) {
+            if ( ! empty( $lines_by_promotion[ (int) $promotion_id ] ) ) {
+                // Per-promotion attribution stamped at checkout (Promotion Engine >= 0.9.30).
+                $entry['lines'] = $lines_by_promotion[ (int) $promotion_id ];
+            } elseif ( $single_promo && ! empty( $order_line_discounts ) ) {
+                // Older engine: subtotal − total per line can only be attributed when one promotion applied.
                 $entry['lines'] = $order_line_discounts;
             }
             $out[] = $entry;
