@@ -2106,8 +2106,13 @@ class OC_StoreOS_Integration {
                 // מחירי השורות כשההנחה כבר מגולמת בהם (orderTotal מפוזר על הפריטים), ולכן השארת
                 // ה-Fee המקורי מהצ'קאאוט מחילה את ההנחה פעמיים ומקטינה את סכום ההזמנה ב-Woo.
                 // Fee חיובי (למשל תוספת משקל) נשאר כמו שהוא.
+                // הנחה ברמת ההזמנה (ValueCard: הטבת מועדון / מימוש נקודות) נשארת: היא נשלחה כ-orderDiscounts,
+                // Giorgio מוריד אותה מ-orderTotal ולא מהשורות - מחיקתה הייתה מחייבת את הלקוח במחיר מלא.
                 $removed_discount_fees = array();
                 foreach ( $order->get_items( 'fee' ) as $fee_id => $fee_item ) {
+                    if ( $this->is_order_level_discount_fee( $order, $fee_item ) ) {
+                        continue;
+                    }
                     if ( (float) $fee_item->get_total() < 0 ) {
                         $removed_discount_fees[] = sprintf( '%s (%s)', $fee_item->get_name(), $fee_item->get_total() );
                         $order->remove_item( $fee_id );
@@ -5450,6 +5455,58 @@ class OC_StoreOS_Integration {
     }
 
     /**
+     * Whether a fee line is an ORDER-LEVEL discount that Giorgio must subtract from the order total itself
+     * (it is not part of any line price) - today the ValueCard club benefit / points redemption.
+     *
+     * Promotion Engine discount fees are NOT order-level here: they travel in appliedPromotions and Giorgio
+     * bakes them into the line prices it sends back.
+     *
+     * @param WC_Order           $order Order object.
+     * @param WC_Order_Item_Fee  $fee   Fee line.
+     * @return bool
+     */
+    protected function is_order_level_discount_fee( $order, $fee ) {
+        $is_discount = false;
+        if ( $fee instanceof WC_Order_Item_Fee && (float) $fee->get_total() < 0 && $order->get_meta( '_ocvc_card' ) ) {
+            $names = array( 'Club benefit', 'Points redemption', 'הטבת מועדון', 'מימוש נקודות' );
+            // The fee is stored under the label translated at checkout; match the current locale's label too.
+            // phpcs:ignore WordPress.WP.I18n.TextDomainMismatch
+            $names[] = __( 'Club benefit', 'oc-valuecard' );
+            // phpcs:ignore WordPress.WP.I18n.TextDomainMismatch
+            $names[] = __( 'Points redemption', 'oc-valuecard' );
+            $is_discount = in_array( trim( (string) $fee->get_name() ), array_map( 'trim', $names ), true );
+        }
+        return (bool) apply_filters( 'oc_storeos_is_order_level_discount_fee', $is_discount, $fee, $order );
+    }
+
+    /**
+     * Order-level discounts (see is_order_level_discount_fee) for the outbound payload. Giorgio stores them as
+     * the order's amount discount so the total it charges after picking keeps them (ValueCard points were
+     * already redeemed at checkout - dropping them charged the customer full price).
+     *
+     * @param WC_Order $order Order object.
+     * @return array
+     */
+    protected function build_order_discounts_for_payload( $order ) {
+        $out = array();
+        foreach ( $order->get_items( 'fee' ) as $fee ) {
+            if ( ! $this->is_order_level_discount_fee( $order, $fee ) ) {
+                continue;
+            }
+            $amount = round( -1 * ( (float) $fee->get_total() + (float) $fee->get_total_tax() ), 2 );
+            if ( $amount <= 0.0 ) {
+                continue;
+            }
+            $out[] = array(
+                'name'   => (string) $fee->get_name(),
+                'amount' => $amount,
+                'source' => 'valuecard',
+            );
+        }
+        return $out;
+    }
+
+    /**
      * Build order payload as JSON-ready array.
      *
      * @param WC_Order $order   Order object.
@@ -5735,6 +5792,9 @@ class OC_StoreOS_Integration {
             // real promotion (not a re-evaluation) and avoids the /redemptions double-count. Always present
             // ([] = no promotions) so the consumer can tell "none" from "not sent".
             'appliedPromotions' => $this->build_applied_promotions_for_payload( $order ),
+            // Order-level discounts that are not in any line price (ValueCard club benefit / points), so
+            // Giorgio subtracts them from the total it charges after picking. Always present ([] = none).
+            'orderDiscounts'    => $this->build_order_discounts_for_payload( $order ),
         );
 
         // שדות הנמען. תמיד נשלחים (isOther=false בהזמנה רגילה) כדי ש-Giorgio יבדיל בין
