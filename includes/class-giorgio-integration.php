@@ -5514,6 +5514,34 @@ class OC_StoreOS_Integration {
      *
      * @return array
      */
+    /**
+     * Marketing consent the customer gave at checkout (deliz theme: order meta _dcc_marketing_consent 'yes'/'no').
+     * true / false, or null when the site did not ask (the box is off, or another theme).
+     */
+    protected function get_marketing_consent_for_payload( $order ) {
+        $v = (string) $order->get_meta( '_dcc_marketing_consent' );
+        if ( 'yes' === $v ) {
+            return true;
+        }
+        if ( 'no' === $v ) {
+            return false;
+        }
+        return null;
+    }
+
+    protected function get_marketing_consent_time_for_payload( $order ) {
+        if ( null === $this->get_marketing_consent_for_payload( $order ) ) {
+            return null;
+        }
+        $t = (string) $order->get_meta( '_dcc_marketing_consent_time' );
+        if ( '' === $t ) {
+            return null;
+        }
+        // current_time( 'mysql' ) = site-local time; read it in the site's timezone (strtotime would treat it as UTC)
+        $d = date_create( $t, wp_timezone() );
+        return $d ? $d->format( 'c' ) : null;
+    }
+
     protected function build_order_payload( $order, $options ) {
         $order_id     = $order->get_id();
         $order_number = (string) $order->get_id(); // Use internal ID as orderNumber for stable external key.
@@ -5775,6 +5803,11 @@ class OC_StoreOS_Integration {
                 'name'  => $customer_name,
                 'phone' => $customer_phone,
                 'email' => $customer_email,
+                // Marketing consent from the checkout box (deliz theme, order meta _dcc_marketing_consent):
+                // true = the customer agreed, false = asked and did not agree, null = not asked on this site.
+                // marketingConsentAt = when it was given / changed (site time, ISO 8601), null when not asked.
+                'marketingConsent'   => $this->get_marketing_consent_for_payload( $order ),
+                'marketingConsentAt' => $this->get_marketing_consent_time_for_payload( $order ),
             ),
             'shippingAddress' => array(
                 'street'    => $shipping_street,
