@@ -194,6 +194,8 @@ class OC_StoreOS_Integration {
 
         // REST API.
         add_action( 'rest_api_init', array( $this, 'register_rest_routes' ) );
+        add_action( 'deliz_marketing_consent_changed', array( $this, 'on_marketing_consent_changed' ), 10, 4 );
+        add_action( 'oc_storeos_push_consent', array( $this, 'push_customer_consent' ), 10, 2 );
         add_filter( 'rest_pre_dispatch', array( $this, 'log_rest_orders_pre_dispatch' ), 5, 3 );
 
         // Outgoing order: sync when the order hits the effective WC status for that order's payment method (not on creation).
@@ -502,6 +504,16 @@ class OC_StoreOS_Integration {
                 array(
                     'methods'             => WP_REST_Server::CREATABLE,
                     'callback'            => array( $this, 'rest_create_order' ),
+                    'permission_callback' => array( $this, 'rest_check_incoming_auth' ),
+                )
+            );
+
+            register_rest_route(
+                $ns,
+                '/customer-consent',
+                array(
+                    'methods'             => WP_REST_Server::CREATABLE,
+                    'callback'            => array( $this, 'rest_customer_consent' ),
                     'permission_callback' => array( $this, 'rest_check_incoming_auth' ),
                 )
             );
@@ -5529,6 +5541,130 @@ class OC_StoreOS_Integration {
         return null;
     }
 
+    /** Per-channel consent (order meta _dcc_consent_email / _dcc_consent_sms); falls back to the overall answer. */
+    protected function get_marketing_consent_channel_for_payload( $order, $channel ) {
+        $v = (string) $order->get_meta( '_dcc_consent_' . $channel );
+        if ( 'yes' === $v ) {
+            return true;
+        }
+        if ( 'no' === $v ) {
+            return false;
+        }
+        return $this->get_marketing_consent_for_payload( $order );
+    }
+
+    /* ------------------------------------------------------------------
+     * Two-way marketing consent sync (deliz theme).
+     *  Site → Giorgio: the theme fires deliz_marketing_consent_changed( $user_id, $channel, $value, $source )
+     *    whenever a customer subscribes / unsubscribes (checkout, account page). We send the customer's current
+     *    state to POST {api_base_url}/WooCommerce/CustomerConsent from WP-Cron (the customer never waits).
+     *    Off until Giorgio's endpoint exists: option oc_storeos_consent_push = 'yes' (filter oc_storeos_consent_push).
+     *  Giorgio → site: POST /wp-json/giorgio/v1/customer-consent (same incoming token as /orders).
+     * ------------------------------------------------------------------ */
+
+    public function on_marketing_consent_changed( $user_id, $channel = '', $value = '', $source = '' ) {
+        if ( 'giorgio' === $source ) {
+            return; // came from Giorgio — do not echo it back
+        }
+        if ( ! apply_filters( 'oc_storeos_consent_push', 'yes' === get_option( 'oc_storeos_consent_push' ), $user_id ) ) {
+            return;
+        }
+        $args = array( (int) $user_id, (string) $source );
+        if ( ! wp_next_scheduled( 'oc_storeos_push_consent', $args ) ) {
+            wp_schedule_single_event( time(), 'oc_storeos_push_consent', $args );
+        }
+    }
+
+    public function push_customer_consent( $user_id, $source = '' ) {
+        $options = $this->get_options();
+        if ( empty( $options['api_base_url'] ) || empty( $options['api_token'] ) || ! function_exists( 'dcc_consent_get' ) ) {
+            return;
+        }
+        $user = get_userdata( (int) $user_id );
+        if ( ! $user ) {
+            return;
+        }
+        $c    = dcc_consent_get( $user->ID );
+        $t    = (string) get_user_meta( $user->ID, '_dcc_marketing_consent_time', true );
+        $d    = '' !== $t ? date_create( $t, wp_timezone() ) : false;
+        $body = array(
+            'siteId'                => ! empty( $options['site_id'] ) ? (string) $options['site_id'] : null,
+            'phone'                 => (string) get_user_meta( $user->ID, 'billing_phone', true ),
+            'email'                 => (string) $user->user_email,
+            'marketingConsent'      => 'yes' === $c['email'] || 'yes' === $c['sms'],
+            'marketingConsentEmail' => 'yes' === $c['email'],
+            'marketingConsentSms'   => 'yes' === $c['sms'],
+            'marketingConsentAt'    => $d ? $d->format( 'c' ) : current_time( 'c' ),
+            'source'                => (string) $source,
+        );
+        $response = wp_remote_post(
+            trailingslashit( $options['api_base_url'] ) . 'WooCommerce/CustomerConsent',
+            array(
+                'timeout'     => 15,
+                'headers'     => array(
+                    'X-Api-Key'     => $options['api_token'],
+                    'Authorization' => 'Bearer ' . $options['api_token'],
+                    'Content-Type'  => 'application/json',
+                ),
+                'body'        => wp_json_encode( $body ),
+                'data_format' => 'body',
+            )
+        );
+        $code = is_wp_error( $response ) ? 0 : (int) wp_remote_retrieve_response_code( $response );
+        if ( $code < 200 || $code >= 300 ) {
+            $this->maybe_debug_log( sprintf( '[OC Giorgio] CustomerConsent push failed. user=%d http=%d err=%s', (int) $user->ID, $code, is_wp_error( $response ) ? $response->get_error_message() : substr( (string) wp_remote_retrieve_body( $response ), 0, 200 ) ) );
+        }
+    }
+
+    /**
+     * POST /giorgio/v1/customer-consent — Giorgio tells the site a customer subscribed / unsubscribed
+     * (e.g. replied STOP to an SMS). Body: phone and/or email, channel (email|sms|all), marketingConsent (bool).
+     */
+    public function rest_customer_consent( $request ) {
+        if ( ! function_exists( 'dcc_consent_set' ) ) {
+            return new WP_REST_Response( array( 'ok' => false, 'error' => 'consent_not_supported_by_theme' ), 501 );
+        }
+        $data    = (array) $request->get_json_params();
+        $channel = isset( $data['channel'] ) ? strtolower( (string) $data['channel'] ) : 'all';
+        if ( ! in_array( $channel, array( 'email', 'sms', 'all' ), true ) || ! array_key_exists( 'marketingConsent', $data ) ) {
+            return new WP_REST_Response( array( 'ok' => false, 'error' => 'channel (email|sms|all) and marketingConsent are required' ), 400 );
+        }
+        $value = filter_var( $data['marketingConsent'], FILTER_VALIDATE_BOOLEAN ) ? 'yes' : 'no';
+        $ids   = array();
+        $email = isset( $data['email'] ) ? sanitize_email( (string) $data['email'] ) : '';
+        if ( '' !== $email ) {
+            $u = get_user_by( 'email', $email );
+            if ( $u ) {
+                $ids[] = (int) $u->ID;
+            }
+        }
+        $digits = isset( $data['phone'] ) ? preg_replace( '/\D+/', '', (string) $data['phone'] ) : '';
+        if ( '' !== $digits ) {
+            $local = 0 === strpos( $digits, '972' ) ? '0' . substr( $digits, 3 ) : $digits;
+            $intl  = 0 === strpos( $local, '0' ) ? '972' . substr( $local, 1 ) : $local;
+            $forms = array_unique( array( $local, $intl, '+' . $intl, substr( $local, 0, 3 ) . '-' . substr( $local, 3 ) ) );
+            $q     = array( 'relation' => 'OR' );
+            foreach ( $forms as $f ) {
+                $q[] = array( 'key' => 'billing_phone', 'value' => $f );
+            }
+            $ids = array_merge( $ids, get_users( array( 'meta_query' => $q, 'fields' => 'ID', 'number' => 20 ) ) );
+        }
+        $ids = array_values( array_unique( array_map( 'intval', $ids ) ) );
+        if ( ! $ids ) {
+            return new WP_REST_Response( array( 'ok' => true, 'updated' => 0, 'matched' => 0 ), 200 );
+        }
+        $ip      = isset( $_SERVER['REMOTE_ADDR'] ) ? sanitize_text_field( wp_unslash( $_SERVER['REMOTE_ADDR'] ) ) : '';
+        $updated = 0;
+        foreach ( $ids as $uid ) {
+            foreach ( 'all' === $channel ? array( 'email', 'sms' ) : array( $channel ) as $ch ) {
+                if ( dcc_consent_set( $uid, $ch, $value, 'giorgio', 0, array( 'ip' => $ip, 'ua' => 'Giorgio' ) ) ) {
+                    $updated++;
+                }
+            }
+        }
+        return new WP_REST_Response( array( 'ok' => true, 'matched' => count( $ids ), 'updated' => $updated ), 200 );
+    }
+
     protected function get_marketing_consent_time_for_payload( $order ) {
         if ( null === $this->get_marketing_consent_for_payload( $order ) ) {
             return null;
@@ -5582,9 +5718,16 @@ class OC_StoreOS_Integration {
                 $recipient_line .= ' | ' . __( 'טלפון:', 'oc-storeos-integration' ) . ' ' . $recipient['phone'];
             }
 
-            $customer_notes = '' !== trim( $customer_notes )
-                ? $recipient_line . "\n" . $customer_notes
-                : $recipient_line;
+            $club_line = 'yes' === (string) $order->get_meta( '_deliz_club_member' ) ? (string) $order->get_meta( '_deliz_club_member_text' ) : '';
+            if ( '' !== $club_line && 0 === strpos( $customer_notes, $club_line ) ) {
+                // "אני חבר מועדון" (deliz theme) stays the first line; the recipient line goes right under it.
+                $rest           = ltrim( substr( $customer_notes, strlen( $club_line ) ), "\r\n" );
+                $customer_notes = $club_line . "\n" . $recipient_line . ( '' !== trim( $rest ) ? "\n" . $rest : '' );
+            } else {
+                $customer_notes = '' !== trim( $customer_notes )
+                    ? $recipient_line . "\n" . $customer_notes
+                    : $recipient_line;
+            }
         }
 
         // Prefer OC Woo Shipping human-readable city (not Google place_id in WC city field).
@@ -5808,6 +5951,11 @@ class OC_StoreOS_Integration {
                 // marketingConsentAt = when it was given / changed (site time, ISO 8601), null when not asked.
                 'marketingConsent'   => $this->get_marketing_consent_for_payload( $order ),
                 'marketingConsentAt' => $this->get_marketing_consent_time_for_payload( $order ),
+                // Per channel (deliz theme 1.6.49+: one checkout box = both; the account page has a toggle per channel).
+                'marketingConsentEmail' => $this->get_marketing_consent_channel_for_payload( $order, 'email' ),
+                'marketingConsentSms'   => $this->get_marketing_consent_channel_for_payload( $order, 'sms' ),
+                // "I'm a club member" toggle at checkout (deliz theme; the text is also the first line of customerNotes).
+                'clubMember'            => 'yes' === (string) $order->get_meta( '_deliz_club_member' ),
             ),
             'shippingAddress' => array(
                 'street'    => $shipping_street,
