@@ -514,7 +514,7 @@ class OC_StoreOS_Integration {
                 array(
                     'methods'             => WP_REST_Server::CREATABLE,
                     'callback'            => array( $this, 'rest_customer_consent' ),
-                    'permission_callback' => array( $this, 'rest_check_incoming_auth' ),
+                    'permission_callback' => array( $this, 'rest_check_incoming_auth_strict' ),
                 )
             );
 
@@ -570,6 +570,24 @@ class OC_StoreOS_Integration {
      * @param WP_REST_Request $request Request.
      * @return true|WP_Error True to allow; WP_Error (401) to block.
      */
+    /**
+     * Strict auth for routes that change customer data (customer-consent): a secret MUST be configured and
+     * the request MUST present it — regardless of incoming_auth_mode (whose off/log/unconfigured states fail
+     * open for the legacy order routes). Otherwise anyone could subscribe / unsubscribe customers by phone.
+     */
+    public function rest_check_incoming_auth_strict( $request ) {
+        $options  = $this->get_options();
+        $expected = isset( $options['incoming_api_token'] ) ? (string) $options['incoming_api_token'] : '';
+        if ( '' === $expected ) {
+            return new WP_Error( 'oc_storeos_incoming_token_not_configured', 'Incoming token is not configured on this site.', array( 'status' => 401 ) );
+        }
+        $presented = $this->get_presented_incoming_token( $request );
+        if ( '' === $presented || ! hash_equals( $expected, $presented ) ) {
+            return new WP_Error( 'oc_storeos_incoming_unauthorized', 'Unauthorized.', array( 'status' => 401 ) );
+        }
+        return true;
+    }
+
     public function rest_check_incoming_auth( $request ) {
         $options   = $this->get_options();
         $mode      = isset( $options['incoming_auth_mode'] ) ? (string) $options['incoming_auth_mode'] : self::INCOMING_AUTH_MODE_OFF;
