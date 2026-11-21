@@ -2322,6 +2322,9 @@ class OC_StoreOS_Integration {
             // Giorgio הוא מקור האמת למבצעים בהזמנה מנוהלת; לא מריצים כאן את מנוע המבצעים מחדש.
             $this->apply_applied_promotions_from_storeos_payload( $order, $data );
 
+            // הנחה ידנית מ-Giorgio (למשל הנחה שניתנה בליקוט): שורת Fee שלילית משלה, לפני calculate_totals וחיוב המסגרת.
+            $this->apply_giorgio_manual_discount_fee( $order, $data );
+
             // שיטת תשלום מ־Giorgio (חובה לפלאקארד/קארדקום לפני מעבר ל־completed): paymentMethod | paymentMethodId | wcPaymentMethod
             $this->apply_payment_method_from_storeos_payload( $order, $data );
 
@@ -2589,6 +2592,43 @@ class OC_StoreOS_Integration {
         if ( ! empty( $clean ) ) {
             $order->update_meta_data( '_promeng_usage_recorded', 1 );
         }
+    }
+
+    /**
+     * The order-level discount Giorgio adds on top of what the store already carries (e.g. a discount given during
+     * picking), as its own negative fee line. Without it the rebuilt order kept the full price: Giorgio subtracted the
+     * discount from orderTotal only, the store recalculated its total from the lines, and the customer's emails, the
+     * invoice and - when the store's own gateway captures - the charge all ignored the discount (1.12.2).
+     * The fee is re-created on every sync from payload "manualDiscount" ({amount, label}); amount 0 removes it.
+     * Older Giorgio versions send no "manualDiscount": the order is then left as it is.
+     *
+     * @param WC_Order $order Order object.
+     * @param array    $data  Incoming payload.
+     */
+    protected function apply_giorgio_manual_discount_fee( WC_Order $order, array $data ) {
+        if ( ! isset( $data['manualDiscount'] ) || ! is_array( $data['manualDiscount'] ) ) {
+            return;
+        }
+        foreach ( $order->get_items( 'fee' ) as $fee_id => $fee_item ) {
+            if ( $fee_item->get_meta( '_giorgio_manual_discount' ) ) {
+                $order->remove_item( $fee_id );
+            }
+        }
+        $amount = isset( $data['manualDiscount']['amount'] ) && is_numeric( $data['manualDiscount']['amount'] )
+            ? round( (float) $data['manualDiscount']['amount'], 2 )
+            : 0.0;
+        if ( $amount <= 0 ) {
+            return;
+        }
+        $label = isset( $data['manualDiscount']['label'] ) ? sanitize_text_field( (string) $data['manualDiscount']['label'] ) : '';
+        $fee   = new WC_Order_Item_Fee();
+        $fee->set_name( '' !== $label ? $label : __( 'הנחה', 'oc-storeos-integration' ) );
+        $fee->set_amount( -$amount );
+        $fee->set_total( -$amount );
+        // Giorgio amounts already include VAT: no tax on top, so the fee is exactly the discount.
+        $fee->set_tax_status( 'none' );
+        $fee->add_meta_data( '_giorgio_manual_discount', '1', true );
+        $order->add_item( $fee );
     }
 
     /**
