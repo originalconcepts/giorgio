@@ -5736,16 +5736,26 @@ class OC_StoreOS_Integration {
                 $recipient_line .= ' | ' . __( 'טלפון:', 'oc-storeos-integration' ) . ' ' . $recipient['phone'];
             }
 
-            $club_line = 'yes' === (string) $order->get_meta( '_deliz_club_member' ) ? (string) $order->get_meta( '_deliz_club_member_text' ) : '';
-            if ( '' !== $club_line && 0 === strpos( $customer_notes, $club_line ) ) {
-                // "אני חבר מועדון" (deliz theme) stays the first line; the recipient line goes right under it.
-                $rest           = ltrim( substr( $customer_notes, strlen( $club_line ) ), "\r\n" );
-                $customer_notes = $club_line . "\n" . $recipient_line . ( '' !== trim( $rest ) ? "\n" . $rest : '' );
-            } else {
-                $customer_notes = '' !== trim( $customer_notes )
-                    ? $recipient_line . "\n" . $customer_notes
-                    : $recipient_line;
+            $customer_notes = '' !== trim( $customer_notes )
+                ? $recipient_line . "\n" . $customer_notes
+                : $recipient_line;
+        }
+
+        // "אני חבר מועדון" (OC_Giorgio_Club_Member) is always the first line, above the recipient line.
+        // Orders from the earlier theme version already carry the text at the start of _billing_notes: strip it first.
+        $club_line = class_exists( 'OC_Giorgio_Club_Member' ) ? OC_Giorgio_Club_Member::order_club_text( $order ) : '';
+        if ( '' !== $club_line ) {
+            $rest = $customer_notes;
+            if ( $recipient['isOther'] && isset( $recipient_line ) && 0 === strpos( $rest, $recipient_line ) ) {
+                $after = ltrim( substr( $rest, strlen( $recipient_line ) ), "\r\n" );
+                if ( 0 === strpos( $after, $club_line ) ) {
+                    $after = ltrim( substr( $after, strlen( $club_line ) ), "\r\n" );
+                }
+                $rest = $recipient_line . ( '' !== trim( $after ) ? "\n" . $after : '' );
+            } elseif ( 0 === strpos( $rest, $club_line ) ) {
+                $rest = ltrim( substr( $rest, strlen( $club_line ) ), "\r\n" );
             }
+            $customer_notes = $club_line . ( '' !== trim( $rest ) ? "\n" . $rest : '' );
         }
 
         // Prefer OC Woo Shipping human-readable city (not Google place_id in WC city field).
@@ -5972,8 +5982,8 @@ class OC_StoreOS_Integration {
                 // Per channel (deliz theme 1.6.49+: one checkout box = both; the account page has a toggle per channel).
                 'marketingConsentEmail' => $this->get_marketing_consent_channel_for_payload( $order, 'email' ),
                 'marketingConsentSms'   => $this->get_marketing_consent_channel_for_payload( $order, 'sms' ),
-                // "I'm a club member" toggle at checkout (deliz theme; the text is also the first line of customerNotes).
-                'clubMember'            => 'yes' === (string) $order->get_meta( '_deliz_club_member' ),
+                // "I'm a club member" toggle at checkout (OC_Giorgio_Club_Member; the text is also the first line of customerNotes).
+                'clubMember'            => class_exists( 'OC_Giorgio_Club_Member' ) && OC_Giorgio_Club_Member::order_is_club_member( $order ),
             ),
             'shippingAddress' => array(
                 'street'    => $shipping_street,
