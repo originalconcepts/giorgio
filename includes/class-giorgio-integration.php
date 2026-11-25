@@ -117,6 +117,15 @@ class OC_StoreOS_Integration {
     /** Card brand from PayPlus (payplus-payment-gateway). */
     const META_PAYPLUS_BRAND_NAME = 'payplus_brand_name';
 
+    /** Checkout token PayPlus issued for the card (payplus-payment-gateway, create_token). */
+    const META_PAYPLUS_TOKEN_UID = 'payplus_token_uid';
+
+    /** PayPlus checkout response JSON (flat: customer_uid, terminal_uid, cashier_uid). */
+    const META_PAYPLUS_RESPONSE = 'payplus_response';
+
+    /** PayPlus IPN/callback JSON (the same ids under data). */
+    const META_PAYPLUS_CALLBACK_RESPONSE = 'payplus_callback_response';
+
     /**
      * payplus-payment-gateway's OWN double-capture guard (checked by its manual "Make Payment" wp-admin
      * action before allowing another capture click) — Giorgio writes this defensively after it charges,
@@ -6327,7 +6336,63 @@ class OC_StoreOS_Integration {
             $fields['numOfPayments'] = (int) $payments;
         }
 
+        // 1.13.1: the checkout token and the terminal the hold sits on. PayPlus refuses to capture a hold for
+        // more than it was placed for, so a picked total above the hold is charged on the token (Giorgio's
+        // no-CVV terminal) and the hold is then cancelled on its own (website) terminal.
+        $token_uid = $this->get_newest_order_meta_value( $order, self::META_PAYPLUS_TOKEN_UID );
+        $response  = $this->get_payplus_response_fields( $order );
+        if ( '' !== $token_uid && '' !== $response['customer_uid'] ) {
+            $fields['token']       = $token_uid;
+            $fields['customerUid'] = $response['customer_uid'];
+        }
+        if ( '' !== $response['terminal_uid'] ) {
+            $fields['holdTerminalUid'] = $response['terminal_uid'];
+        }
+        if ( '' !== $response['cashier_uid'] ) {
+            $fields['holdCashierUid'] = $response['cashier_uid'];
+        }
+        $four_digits = $this->get_newest_order_meta_value( $order, self::META_PAYPLUS_FOUR_DIGITS );
+        if ( preg_match( '/^\d{4}$/', $four_digits ) ) {
+            $fields['last4Digits'] = $four_digits;
+        }
+        $brand = $this->get_newest_order_meta_value( $order, self::META_PAYPLUS_BRAND_NAME );
+        if ( '' !== $brand ) {
+            $fields['cardBrand'] = $brand;
+        }
+
         return (array) apply_filters( 'oc_storeos_giorgio_payplus_capture_handover_fields', $fields, $order );
+    }
+
+    /**
+     * customer_uid / terminal_uid / cashier_uid from the PayPlus checkout response the vendor plugin stores
+     * on the order (payplus_response, flat; payplus_callback_response keeps them under data).
+     *
+     * @param WC_Order $order Order.
+     * @return array{customer_uid:string,terminal_uid:string,cashier_uid:string}
+     */
+    protected function get_payplus_response_fields( WC_Order $order ) {
+        $out = array(
+            'customer_uid' => '',
+            'terminal_uid' => '',
+            'cashier_uid'  => '',
+        );
+        foreach ( array( self::META_PAYPLUS_RESPONSE, self::META_PAYPLUS_CALLBACK_RESPONSE ) as $meta_key ) {
+            $raw = $this->get_newest_order_meta_value( $order, $meta_key );
+            if ( '' === $raw ) {
+                continue;
+            }
+            $decoded = json_decode( $raw, true );
+            if ( ! is_array( $decoded ) ) {
+                continue;
+            }
+            $source = ( isset( $decoded['data'] ) && is_array( $decoded['data'] ) ) ? $decoded['data'] : $decoded;
+            foreach ( array_keys( $out ) as $key ) {
+                if ( '' === $out[ $key ] && isset( $source[ $key ] ) && is_scalar( $source[ $key ] ) ) {
+                    $out[ $key ] = trim( (string) $source[ $key ] );
+                }
+            }
+        }
+        return $out;
     }
 
     /**
