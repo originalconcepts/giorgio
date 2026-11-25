@@ -2198,10 +2198,15 @@ class OC_StoreOS_Integration {
                 // ננקה גם שורות Fee שליליות (הנחות, למשל "5% הנחת לקוח מועדון"): Giorgio מחזיר את
                 // מחירי השורות כשההנחה כבר מגולמת בהם (orderTotal מפוזר על הפריטים), ולכן השארת
                 // ה-Fee המקורי מהצ'קאאוט מחילה את ההנחה פעמיים ומקטינה את סכום ההזמנה ב-Woo.
-                // Fee חיובי (למשל תוספת משקל) נשאר כמו שהוא.
+                // תוספת מסגרת למשקל ("תוספת משקל" של Giorgio / "הערכת משקל" של PayPlus) גם נמחקת: היא
+                // קיימת רק כדי שתפיסת המסגרת בצ'קאאוט תכסה סטייה בשקילה. Giorgio מחזיר את השורות השקולות
+                // ו-orderTotal בלי התוספת, וזה מה שהוא מחייב — השארתה הציגה ב-Woo ובמייל "הושלמה" סכום
+                // גבוה מהחיוב בפועל (pepe 13840: נשקל 43.58, Woo הציג 48.96).
+                // Fee חיובי אחר נשאר כמו שהוא.
                 // הנחה ברמת ההזמנה (ValueCard: הטבת מועדון / מימוש נקודות) נשארת: היא נשלחה כ-orderDiscounts,
                 // Giorgio מוריד אותה מ-orderTotal ולא מהשורות - מחיקתה הייתה מחייבת את הלקוח במחיר מלא.
                 $removed_discount_fees = array();
+                $removed_buffer_fees   = array();
                 foreach ( $order->get_items( 'fee' ) as $fee_id => $fee_item ) {
                     if ( $this->is_order_level_discount_fee( $order, $fee_item ) ) {
                         continue;
@@ -2209,7 +2214,34 @@ class OC_StoreOS_Integration {
                     if ( (float) $fee_item->get_total() < 0 ) {
                         $removed_discount_fees[] = sprintf( '%s (%s)', $fee_item->get_name(), $fee_item->get_total() );
                         $order->remove_item( $fee_id );
+                    } elseif ( $this->is_weight_buffer_fee( $order, $fee_item ) ) {
+                        $removed_buffer_fees[] = sprintf(
+                            '%s (%s)',
+                            $fee_item->get_name(),
+                            wc_format_decimal( (float) $fee_item->get_total() + (float) $fee_item->get_total_tax(), 2 )
+                        );
+                        $order->remove_item( $fee_id );
                     }
+                }
+                if ( ! empty( $removed_buffer_fees ) ) {
+                    $this->oc_storeos_wc_log(
+                        'info',
+                        sprintf(
+                            'Incoming REST rebuild: removed weight buffer fee line(s) on order %d (hold-only, not part of the weighed total): %s',
+                            (int) $order->get_id(),
+                            implode( ', ', $removed_buffer_fees )
+                        ),
+                        array( 'order_id' => (int) $order->get_id() )
+                    );
+                    $order->add_order_note(
+                        sprintf(
+                            /* translators: %s: removed fee line(s), e.g. "הערכת משקל (5.38)" */
+                            __( 'הוסרה שורת תוספת המסגרת: %s. התוספת שימשה רק לתפיסת המסגרת בתשלום; סכום ההזמנה מעודכן לפי השקילה מ-Giorgio.', 'oc-storeos-integration' ),
+                            implode( ', ', $removed_buffer_fees )
+                        ),
+                        false,
+                        false
+                    );
                 }
                 if ( ! empty( $removed_discount_fees ) ) {
                     $this->oc_storeos_wc_log(
@@ -5627,6 +5659,37 @@ class OC_StoreOS_Integration {
             $is_discount = in_array( trim( (string) $fee->get_name() ), array_map( 'trim', $names ), true );
         }
         return (bool) apply_filters( 'oc_storeos_is_order_level_discount_fee', $is_discount, $fee, $order );
+    }
+
+    /**
+     * Whether a fee line is a weight buffer added at checkout only to enlarge the card hold: Giorgio's own
+     * percentage fee (order_total_fee_percent, label "תוספת משקל" or the configured text) or PayPlus's
+     * J5 "Weight Estimate" fee (payplus-payment-gateway, j5_weight_estimate_*). Giorgio never charges it —
+     * it charges the weighed lines — so the incoming rebuild drops it.
+     *
+     * @param WC_Order          $order Order object.
+     * @param WC_Order_Item_Fee $fee   Fee line.
+     * @return bool
+     */
+    protected function is_weight_buffer_fee( $order, $fee ) {
+        $is_buffer = false;
+        if ( $fee instanceof WC_Order_Item_Fee && (float) $fee->get_total() > 0 ) {
+            $names = array(
+                $this->get_order_total_fee_cart_label(),
+                'תוספת משקל',
+                'Weight Estimate',
+                'הערכת משקל',
+                // phpcs:ignore WordPress.WP.I18n.TextDomainMismatch
+                __( 'Weight Estimate', 'payplus-payment-gateway' ),
+            );
+            $payplus = get_option( 'woocommerce_payplus-payment-gateway_settings', array() );
+            if ( is_array( $payplus ) && ! empty( $payplus['j5_weight_estimate_name'] ) ) {
+                $names[] = (string) $payplus['j5_weight_estimate_name'];
+            }
+            $names     = array_filter( array_map( 'trim', $names ), 'strlen' );
+            $is_buffer = in_array( trim( (string) $fee->get_name() ), $names, true );
+        }
+        return (bool) apply_filters( 'oc_storeos_is_weight_buffer_fee', $is_buffer, $fee, $order );
     }
 
     /**
