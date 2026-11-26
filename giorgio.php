@@ -3,7 +3,7 @@
  * Plugin Name: OC Giorgio Integration
  * Plugin URI: https://onlinestore.co.il
  * Description: Two-way order sync between WooCommerce and the Giorgio platform.
- * Version: 1.13.2
+ * Version: 1.14.0
  * Author: Original Concepts
  * Author URI: https://onlinestore.co.il
  * Text Domain: oc-storeos-integration
@@ -13,7 +13,7 @@ if ( ! defined( 'ABSPATH' ) ) {
     exit;
 }
 
-define( 'OC_STOREOS_INTEGRATION_VERSION', '1.13.2' );
+define( 'OC_STOREOS_INTEGRATION_VERSION', '1.14.0' );
 define( 'OC_STOREOS_INTEGRATION_PLUGIN_FILE', __FILE__ );
 define( 'OC_STOREOS_INTEGRATION_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
 
@@ -400,6 +400,7 @@ require_once OC_STOREOS_INTEGRATION_PLUGIN_DIR . 'includes/class-giorgio-integra
 require_once OC_STOREOS_INTEGRATION_PLUGIN_DIR . 'includes/class-giorgio-ed-product-rest.php';
 require_once OC_STOREOS_INTEGRATION_PLUGIN_DIR . 'includes/class-giorgio-attribute-term-order.php';
 require_once OC_STOREOS_INTEGRATION_PLUGIN_DIR . 'includes/class-giorgio-category-seo.php';
+require_once OC_STOREOS_INTEGRATION_PLUGIN_DIR . 'includes/class-giorgio-club-member.php';
 
 // Declare compatibility with WooCommerce High-Performance Order Storage (custom order tables).
 add_action(
@@ -425,6 +426,8 @@ add_action(
             new OC_Giorgio_Attribute_Term_Order();
             // Category SEO title / meta description pushed by Giorgio (REST field giorgio_seo on product_cat); see the class doc.
             new OC_Giorgio_Category_SEO();
+            // "אני חבר מועדון" checkout toggle (settings: Orders tab); see the class doc.
+            new OC_Giorgio_Club_Member();
         }
     }
 );
