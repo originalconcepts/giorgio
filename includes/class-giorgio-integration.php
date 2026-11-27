@@ -103,6 +103,26 @@ class OC_StoreOS_Integration {
     const GATEWAY_PAYPLUS = 'payplus-payment-gateway';
 
     /**
+     * PayPlus card-flow gateway ids: the main gateway and the sub-gateways that extend it with the same
+     * J5 hold, token and transaction meta (vendor includes/wc_payplus_subgateways.php). PayPlus also
+     * rewrites the order's payment method to the wallet actually used (wc_payplus_gateway.php, method map:
+     * apple-pay → payplus-payment-gateway-applepay), so an Apple Pay / Google Pay order paid on the main
+     * page arrives here with the wallet id (PEPE #13846, 25/11/2026: no handover, Giorgio could not charge).
+     * Not bit / MULTIPASS / PayPal / gift cards: those are not card holds.
+     */
+    const PAYPLUS_CARD_GATEWAYS = array(
+        'payplus-payment-gateway',
+        'payplus-payment-gateway-applepay',
+        'payplus-payment-gateway-googlepay',
+        'payplus-payment-gateway-hostedfields',
+    );
+
+    /** True for the PayPlus gateway and its card-flow wallets (see PAYPLUS_CARD_GATEWAYS). */
+    protected static function is_payplus_card_gateway( $gateway_id ) {
+        return in_array( (string) $gateway_id, self::PAYPLUS_CARD_GATEWAYS, true );
+    }
+
+    /**
      * PayPlus transaction_uid (payplus-payment-gateway) — unlike Cardcom's token+approval pair, PayPlus
      * captures/refunds/voids using the SAME id the checkout authorization returned.
      */
@@ -1674,7 +1694,7 @@ class OC_StoreOS_Integration {
      * @return array|null Keys: `status` ('captured'|'not_captured'|'unknown'), `gateway`.
      */
     protected function build_rest_payment_capture_summary( WC_Order $order ) {
-        if ( self::GATEWAY_PAYPLUS === (string) $order->get_payment_method() ) {
+        if ( self::is_payplus_card_gateway( $order->get_payment_method() ) ) {
             // PayPlus never auto-captures on any status change (unlike Cardcom) — there is no capture
             // flag to judge here at all; the charge outcome always arrives via
             // apply_giorgio_payment_result_to_order's `payment` block, whether or not the toggle is on.
@@ -1916,7 +1936,8 @@ class OC_StoreOS_Integration {
         }
         $page       = max( 1, (int) $page );
         $limit      = 25;
-        $gateway_id = ( 'payplus' === $profile ) ? self::GATEWAY_PAYPLUS : self::GATEWAY_CARDCOM;
+        // PayPlus: the wallet sub-gateways too (an Apple Pay order carries the wallet id, see PAYPLUS_CARD_GATEWAYS).
+        $gateway_id = ( 'payplus' === $profile ) ? self::PAYPLUS_CARD_GATEWAYS : self::GATEWAY_CARDCOM;
 
         $orders = wc_get_orders(
             array(
@@ -6380,7 +6401,7 @@ class OC_StoreOS_Integration {
         if ( ! $this->giorgio_owns_payplus_capture() ) {
             return array();
         }
-        if ( self::GATEWAY_PAYPLUS !== (string) $order->get_payment_method() ) {
+        if ( ! self::is_payplus_card_gateway( $order->get_payment_method() ) ) {
             return array();
         }
 
@@ -7137,7 +7158,7 @@ class OC_StoreOS_Integration {
         }
 
         if ( $order instanceof WC_Order
-            && self::GATEWAY_PAYPLUS === (string) $order->get_payment_method()
+            && self::is_payplus_card_gateway( $order->get_payment_method() )
             && $this->giorgio_owns_payplus_capture() ) {
             $this->oc_storeos_wc_log(
                 'info',
@@ -7331,7 +7352,7 @@ class OC_StoreOS_Integration {
         } elseif ( '' !== $cardcom_deal ) {
             // Deal meta (label "Cardcom Payment ID") even if gateway class loads later or slug differs.
             $profile = 'cardcom';
-        } elseif ( self::GATEWAY_PAYPLUS === $method && $payplus_ready ) {
+        } elseif ( self::is_payplus_card_gateway( $method ) && $payplus_ready ) {
             $profile = 'payplus';
         } elseif ( '' !== $payplus_tx_uid ) {
             // transaction_uid even if the gateway class loads later or the id string differs.
@@ -7534,7 +7555,8 @@ class OC_StoreOS_Integration {
             $payment_block = array_merge(
                 array(
                     'transactionId'    => '' !== $transaction_uid ? $transaction_uid : null,
-                    'paymentGateway'   => self::GATEWAY_PAYPLUS,
+                    // The order's own id (…-applepay / …-googlepay for a wallet) so Giorgio can show the wallet.
+                    'paymentGateway'   => self::is_payplus_card_gateway( $order->get_payment_method() ) ? (string) $order->get_payment_method() : self::GATEWAY_PAYPLUS,
                     'authorizedAmount' => (float) $order->get_total(),
                 ),
                 $handover
